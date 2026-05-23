@@ -137,6 +137,21 @@ impl HnswMemIndex {
         self.state.get().map(|s| s.graph.len()).unwrap_or(0)
     }
 
+    /// Estimated heap bytes held by the index. The vectors themselves are
+    /// borrowed from the memtable's Arrow batches (counted by the memtable, not
+    /// here); this covers the per-row bookkeeping arrays (row id + batch
+    /// lookup) and the graph adjacency (level-0 up to `2m` neighbors, higher
+    /// levels ~`m`, as `u32` ids). Approximate.
+    pub fn memory_size(&self) -> usize {
+        let n = self.len();
+        if n == 0 {
+            return 0;
+        }
+        const STORAGE_BYTES_PER_ROW: usize = 16; // row_id u64 + RowLookup{u32,u32}
+        let adjacency_per_row = 3 * self.build_params.m * std::mem::size_of::<u32>();
+        n * (STORAGE_BYTES_PER_ROW + adjacency_per_row)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

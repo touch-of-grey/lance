@@ -204,6 +204,15 @@ impl BTreeMemIndex {
         self.lookup.len()
     }
 
+    /// Estimated heap bytes held by the index. Approximate: one skip-list entry
+    /// per row, counting the `IndexKey` plus per-node skip-list overhead. Does
+    /// not add variable per-key heap (e.g. string scalar bytes), so it slightly
+    /// undercounts string-keyed indexes.
+    pub fn memory_size(&self) -> usize {
+        const SKIPLIST_NODE_OVERHEAD: usize = 48;
+        self.lookup.len() * (std::mem::size_of::<IndexKey>() + SKIPLIST_NODE_OVERHEAD)
+    }
+
     /// Check if the index is empty.
     pub fn is_empty(&self) -> bool {
         self.lookup.is_empty()

@@ -50,6 +50,7 @@ use lance_index::scalar::ScalarIndexParams;
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams;
+use lance_io::object_store::ObjectStore as LanceObjectStore;
 use lance_linalg::distance::DistanceType;
 use serde_json::json;
 use uuid::Uuid;
@@ -360,7 +361,13 @@ async fn run(args: Args) -> Result<()> {
         args.text_bytes,
     )?;
     let batches = RecordBatchIterator::new([Ok(seed_batch)], schema.clone());
-    let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default())).await?;
+    // Pin the whole benchmark to Lance file format v2.2 (data storage version)
+    // so every write — seed, flush data file, and index files — is v2.2.
+    let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(batches, &uri, Some(write_params)).await?;
 
     let index_start = Instant::now();
     for kind in &args.indexes {
@@ -508,6 +515,10 @@ async fn run(args: Args) -> Result<()> {
         (elapsed_drain_s, elapsed_total_s, stats)
     };
 
+    // On-disk size of the flushed L0 generation(s) for this shard.
+    let flushed_gen_bytes = flushed_generation_bytes(&uri, shard_id).await;
+    let index_memory_bytes = final_memtable_stats.as_ref().map(|s| s.index_memory_bytes);
+
     let rows = completed_calls * args.batch_rows;
     let puts_rows_s = rows as f64 / elapsed_puts_s;
     let total_rows_s = rows as f64 / elapsed_total_s;
@@ -572,7 +583,7 @@ async fn run(args: Args) -> Result<()> {
         .unwrap_or(0);
 
     println!(
-        "result mode={} indexes={} rows={} result_rows_s={:.1} result_mb_s={:.2} puts_rows_s={:.1} drained_rows_s={:.1} puts_mb_s={:.2} drained_mb_s={:.2} setup_s={:.3} index_setup_s={:.3} batch_build_s={:.3} puts_s={:.3} drain_s={:.3} total_s={:.3} skip_close={} p50_ms={:.2} p90_ms={:.2} p99_ms={:.2} slow_puts_1s={} slow_puts_10s={} wal_flushes={} final_wal_pending_batches={} final_wal_pending_rows={} final_wal_pending_mb={:.2} final_memtable_rows={} final_memtable_batches={} index_update_s={:.3} memtable_flush_s={:.3} memtable_flush_count={} avg_memtable_flush_ms={:.1} final_memtable_mb={:.2} final_frozen_count={} final_unflushed_mb={:.2} max_frozen_count={} bp_count={} bp_wait_ms={}",
+        "result mode={} indexes={} rows={} result_rows_s={:.1} result_mb_s={:.2} puts_rows_s={:.1} drained_rows_s={:.1} puts_mb_s={:.2} drained_mb_s={:.2} setup_s={:.3} index_setup_s={:.3} batch_build_s={:.3} puts_s={:.3} drain_s={:.3} total_s={:.3} skip_close={} p50_ms={:.2} p90_ms={:.2} p99_ms={:.2} slow_puts_1s={} slow_puts_10s={} wal_flushes={} final_wal_pending_batches={} final_wal_pending_rows={} final_wal_pending_mb={:.2} final_memtable_rows={} final_memtable_batches={} index_update_s={:.3} memtable_flush_s={:.3} memtable_flush_count={} avg_memtable_flush_ms={:.1} final_memtable_mb={:.2} final_frozen_count={} final_unflushed_mb={:.2} max_frozen_count={} bp_count={} bp_wait_ms={} index_memory_mb={:.1} flushed_gen_mb={:.1}",
         args.mode.as_str(),
         index_set_label(&args.indexes),
         rows,
@@ -610,6 +621,8 @@ async fn run(args: Args) -> Result<()> {
         max_frozen_count,
         bp_stats.total_count,
         bp_stats.total_wait_ms,
+        index_memory_bytes.unwrap_or(0) as f64 / 1_000_000.0,
+        flushed_gen_bytes.unwrap_or(0) as f64 / 1_000_000.0,
     );
 
     let output = json!({
@@ -663,6 +676,8 @@ async fn run(args: Args) -> Result<()> {
         "final_unflushed_memtable_bytes": final_memtable_stats.as_ref().map(|s| s.unflushed_memtable_bytes),
         "max_frozen_memtable_count": max_frozen_count,
         "max_unflushed_memtable_bytes_observed": max_unflushed_bytes,
+        "index_memory_bytes": index_memory_bytes,
+        "flushed_generation_bytes": flushed_gen_bytes,
         "backpressure": {
             "count": bp_stats.total_count,
             "total_wait_ms": bp_stats.total_wait_ms,
@@ -696,6 +711,24 @@ async fn run(args: Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Total on-disk bytes of the flushed L0 generation(s): every object under the
+/// shard's `_mem_wal/<shard>/..._gen_*` folders (data file, bloom filter, and
+/// the `_indices/*` index files). Returns `None` if the store can't be listed.
+async fn flushed_generation_bytes(uri: &str, shard_id: Uuid) -> Option<u64> {
+    use futures::StreamExt;
+    let (store, base) = LanceObjectStore::from_uri(uri).await.ok()?;
+    let prefix = base.child("_mem_wal").child(shard_id.to_string());
+    let mut stream = store.list(Some(prefix));
+    let mut total: u64 = 0;
+    while let Some(item) = stream.next().await {
+        let Ok(meta) = item else { continue };
+        if meta.location.as_ref().contains("_gen_") {
+            total += meta.size as u64;
+        }
+    }
+    Some(total)
 }
 
 async fn create_base_btree_index(dataset: &mut Dataset) -> Result<()> {
@@ -775,6 +808,7 @@ fn push_sample(
         "frozen_memtable_bytes": memtable.as_ref().map(|stats| stats.frozen_memtable_bytes),
         "frozen_memtable_count": memtable.as_ref().map(|stats| stats.frozen_memtable_count),
         "unflushed_memtable_bytes": memtable.as_ref().map(|stats| stats.unflushed_memtable_bytes),
+        "index_memory_bytes": memtable.as_ref().map(|stats| stats.index_memory_bytes),
     }));
 }
 
@@ -795,6 +829,7 @@ fn memtable_stats_json(memtable: Option<&MemTableStats>) -> serde_json::Value {
             "frozen_memtable_bytes": stats.frozen_memtable_bytes,
             "frozen_memtable_count": stats.frozen_memtable_count,
             "unflushed_memtable_bytes": stats.unflushed_memtable_bytes,
+            "index_memory_bytes": stats.index_memory_bytes,
         }),
         None => serde_json::Value::Null,
     }

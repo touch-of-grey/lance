@@ -62,24 +62,26 @@ d = sys.argv[1]
 # flush_s   = persisted L0 write + persisted index build (the cee7d32 change)
 # idx_upd_s = in-memory index build streamed during puts (HNSW/FTS/btree in RAM)
 # drain_s   = total close() wall time (final WAL flush + freeze + flush)
-print(f"{'cell':40s} {'indexes':22s} {'rows':>9s} {'memtable_MB':>11s} "
-      f"{'puts_s':>8s} {'idx_upd_s':>9s} {'flush_s':>8s} {'avg_flush_ms':>12s} "
-      f"{'flush_MB/s':>10s} {'drain_s':>8s}")
+# data_MB    = buffered row data + bloom (combo-independent)
+# idxmem_MB  = in-memory maintained indexes (btree/HNSW/FTS), on top of data_MB
+# gen_disk_MB= total on-disk size of the flushed generation (data + index files)
+print(f"{'cell':40s} {'indexes':22s} {'rows':>9s} {'data_MB':>9s} {'idxmem_MB':>9s} "
+      f"{'idx_upd_s':>9s} {'flush_s':>8s} {'flush_MB/s':>10s} {'gen_disk_MB':>11s} {'drain_s':>8s}")
 for p in sorted(glob.glob(os.path.join(d, "*.json"))):
     try: r = json.load(open(p))
     except Exception: continue
     name = os.path.basename(p)[:-5]
     rows = r.get("total_rows_written", 0)
     mt_mb = (r.get("final_memtable_bytes") or 0) / 1e6
+    idxmem_mb = (r.get("index_memory_bytes") or 0) / 1e6
+    gen_mb = (r.get("flushed_generation_bytes") or 0) / 1e6
     ws = r.get("write_stats") or {}
     flush_s = ws.get("memtable_flush_time_seconds", 0.0)
-    avg_ms = r.get("avg_memtable_flush_ms", 0.0)
     rb = r.get("row_bytes", 0)
     flush_mbps = (rows * rb / 1e6 / flush_s) if flush_s > 0 else 0.0
-    print(f"{name:40s} {r.get('indexes',''):22s} {rows:>9d} {mt_mb:>11.1f} "
-          f"{r.get('elapsed_puts_seconds',0):>8.2f} "
+    print(f"{name:40s} {r.get('indexes',''):22s} {rows:>9d} {mt_mb:>9.0f} {idxmem_mb:>9.0f} "
           f"{ws.get('index_update_time_seconds',0):>9.2f} "
-          f"{flush_s:>8.2f} {avg_ms:>12.1f} {flush_mbps:>10.1f} "
+          f"{flush_s:>8.2f} {flush_mbps:>10.1f} {gen_mb:>11.0f} "
           f"{r.get('elapsed_drain_seconds',0):>8.2f}")
 PY
 }

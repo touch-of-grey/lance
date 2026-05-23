@@ -1718,6 +1718,7 @@ impl ShardWriter {
             frozen_memtable_bytes,
             frozen_memtable_count: state.frozen_flush_watchers.len(),
             unflushed_memtable_bytes: active_bytes + frozen_memtable_bytes,
+            index_memory_bytes: state.memtable.index_memory_size(),
         })
     }
 
@@ -1999,6 +2000,9 @@ pub struct MemTableStats {
     /// Total unflushed bytes (active + frozen) — the quantity backpressure
     /// compares against `max_unflushed_memtable_bytes`.
     pub unflushed_memtable_bytes: usize,
+    /// Estimated heap bytes held by the active memtable's maintained in-memory
+    /// indexes (btree/HNSW/FTS), separate from `estimated_size` (row data).
+    pub index_memory_bytes: usize,
 }
 
 /// WAL statistics.
