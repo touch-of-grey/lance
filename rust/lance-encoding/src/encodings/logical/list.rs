@@ -302,6 +302,95 @@ mod tests {
         check_basic_random(field).await;
     }
 
+    // Repro for the HNSW-flush bug: a List<u32> with many rows of moderate,
+    // variable length (the shape of an HNSW graph's __neighbors column). At
+    // v2.2 the miniblock chunks use u32 sizes (>32 KiB allowed); this exercises
+    // the large-chunk List encode/decode round-trip at scale.
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_list_u32_large_variable_v2_2(#[values(20_000, 50_000)] num_rows: usize) {
+        use arrow_array::UInt32Array;
+        let lengths: Vec<i32> = (0..num_rows).map(|i| (1 + (i % 40)) as i32).collect();
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        let mut acc = 0i32;
+        offsets.push(0);
+        for l in &lengths {
+            acc += *l;
+            offsets.push(acc);
+        }
+        let values = UInt32Array::from((0..acc as u32).collect::<Vec<_>>());
+        let lists = ListArray::new(
+            Arc::new(Field::new("item", DataType::UInt32, true)),
+            OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets)),
+            Arc::new(values),
+            None,
+        );
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_2);
+        check_round_trip_encoding_of_data(vec![Arc::new(lists)], &test_cases, metadata).await;
+    }
+
+    // Faithful repro of the HNSW graph batch: a struct of {vector_id: u32,
+    // __neighbors: List<u32>, __dists: List<f32>} at scale, exercised with
+    // random-access takes (the path `fast_search` uses) at v2.2.
+    #[test_log::test(tokio::test)]
+    async fn test_hnsw_graph_struct_shape_v2_2() {
+        use arrow_array::{Float32Array, StructArray, UInt32Array};
+
+        let num_rows = 53_000usize;
+        // HNSW-like: dense level-0 rows first, then geometrically fewer/shorter
+        // rows per level, with empty lists in the sparse tail (entry nodes).
+        let lengths: Vec<i32> = (0..num_rows)
+            .map(|i| {
+                let l = 40i32 - (i as i32 / 1300);
+                l.max(0)
+            })
+            .collect();
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        let mut acc = 0i32;
+        offsets.push(0);
+        for l in &lengths {
+            acc += *l;
+            offsets.push(acc);
+        }
+        let total = acc as usize;
+        let off_buf = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets));
+        let ids = UInt32Array::from((0..num_rows as u32).collect::<Vec<_>>());
+        let neighbors = ListArray::new(
+            Arc::new(Field::new("item", DataType::UInt32, true)),
+            off_buf.clone(),
+            Arc::new(UInt32Array::from((0..total as u32).collect::<Vec<_>>())),
+            None,
+        );
+        let dists = ListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            off_buf,
+            Arc::new(Float32Array::from(
+                (0..total).map(|v| v as f32).collect::<Vec<_>>(),
+            )),
+            None,
+        );
+        let struct_arr = StructArray::new(
+            Fields::from(vec![
+                Field::new("vector_id", DataType::UInt32, false),
+                Field::new("__neighbors", make_list_type(DataType::UInt32), true),
+                Field::new("__dists", make_list_type(DataType::Float32), true),
+            ]),
+            vec![Arc::new(ids), Arc::new(neighbors), Arc::new(dists)],
+            None,
+        );
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_batch_size(1024)
+            .with_indices(vec![0, 1, 12_345, 40_000, 49_999]);
+        check_round_trip_encoding_of_data(vec![Arc::new(struct_arr)], &test_cases, HashMap::new())
+            .await;
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_nested_strings() {
         let field = Field::new("", make_list_type(DataType::Utf8), true);

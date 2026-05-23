@@ -1703,6 +1703,122 @@ mod tests {
         .await
     }
 
+    // Faithful repro of the HNSW graph file written during mem_wal flush: three
+    // top-level columns {vector_id: u32, __neighbors: List<u32>, __dists:
+    // List<f32>} at scale (>32k rows), dense level-0 lists tapering to empty
+    // entry-node lists, written with the real FileWriter at v2.2 and read back
+    // in full. A mismatch in the per-column decoded length trips the root
+    // struct decoder (struct.rs:382) — the read-side failure seen in the
+    // >32k-node HNSW flush.
+    #[tokio::test]
+    async fn test_hnsw_graph_three_columns_v2_2_round_trip() {
+        use crate::testing::read_lance_file;
+        use arrow_array::{Float32Array, ListArray, RecordBatchIterator, UInt32Array};
+        use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow_schema::Schema as ArrowSchema;
+        use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+
+        let num_rows = 53_000usize;
+        let lengths: Vec<i32> = (0..num_rows)
+            .map(|i| (40i32 - (i as i32 / 1300)).max(0))
+            .collect();
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        let mut acc = 0i32;
+        offsets.push(0);
+        for l in &lengths {
+            acc += *l;
+            offsets.push(acc);
+        }
+        let total = acc as usize;
+        let off = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets));
+        let u32_item = Arc::new(Field::new("item", DataType::UInt32, true));
+        let f32_item = Arc::new(Field::new("item", DataType::Float32, true));
+        let ids = UInt32Array::from((0..num_rows as u32).collect::<Vec<_>>());
+        let neighbors = ListArray::new(
+            u32_item.clone(),
+            off.clone(),
+            Arc::new(UInt32Array::from((0..total as u32).collect::<Vec<_>>())),
+            None,
+        );
+        let dists = ListArray::new(
+            f32_item.clone(),
+            off,
+            Arc::new(Float32Array::from(
+                (0..total).map(|v| v as f32).collect::<Vec<_>>(),
+            )),
+            None,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("vector_id", DataType::UInt32, false),
+            Field::new("__neighbors", DataType::List(u32_item), true),
+            Field::new("__dists", DataType::List(f32_item), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(neighbors), Arc::new(dists)],
+        )
+        .unwrap();
+
+        let fs = FsFixture::default();
+        write_lance_file(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &fs,
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Full scan first (sequential decode).
+        let full = read_lance_file(
+            &fs,
+            Arc::new(DecoderPlugins::default()),
+            FilterExpression::no_filter(),
+        )
+        .await;
+        let got: usize = full.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(got, num_rows, "full-scan decoded row count mismatch");
+
+        // Random-access take spanning all chunks — the path the HNSW KNN search
+        // uses (fetch specific candidate rows).
+        let indices = UInt32Array::from((0..num_rows as u32).step_by(97).collect::<Vec<_>>());
+        let want = indices.len();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::new(DecoderPlugins::default()),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let taken: usize = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::Indices(indices),
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(
+            taken, want,
+            "take decoded row count mismatch (root struct decode)"
+        );
+    }
+
     type Transformer = Box<dyn Fn(&RecordBatch) -> RecordBatch>;
 
     async fn verify_expected(
