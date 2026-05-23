@@ -1718,10 +1718,8 @@ mod tests {
         use arrow_schema::Schema as ArrowSchema;
         use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 
-        let num_rows = 53_000usize;
-        let lengths: Vec<i32> = (0..num_rows)
-            .map(|i| (40i32 - (i as i32 / 1300)).max(0))
-            .collect();
+        let num_rows = 280_000usize;
+        let lengths: Vec<i32> = (0..num_rows).map(|i| 1 + (i % 40) as i32).collect();
         let mut offsets = Vec::with_capacity(num_rows + 1);
         let mut acc = 0i32;
         offsets.push(0);
