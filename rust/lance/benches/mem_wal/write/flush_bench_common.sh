@@ -98,8 +98,14 @@ for p in sorted(glob.glob(os.path.join(d, "*.json"))):
     ws = r.get("write_stats") or {}
     bp = r.get("backpressure") or {}
     flushes = ws.get("memtable_flush_count", 0)
+    # Actual per-flush size (the memtable freezes on batch count, not the row
+    # capacity), falling back to the configured batch trigger when 0 flushes.
+    if flushes:
+        flush_size = ws.get("memtable_flush_rows", 0) // flushes
+    else:
+        flush_size = r.get("max_memtable_batches", 0) * r.get("batch_rows", 0)
     print(f"{name:40s} {r.get('indexes',''):22s} "
-          f"{r.get('max_memtable_rows',0):>10d} "
+          f"{flush_size:>10d} "
           f"{r.get('throughput_puts_rows_per_sec',0):>11.0f} "
           f"{r.get('throughput_puts_mb_per_sec',0):>9.1f} {flushes:>7d} "
           f"{r.get('avg_memtable_flush_ms',0):>12.1f} "
