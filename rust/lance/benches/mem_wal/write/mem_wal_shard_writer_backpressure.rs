@@ -46,6 +46,7 @@ use lance::index::vector::VectorIndexParams;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::Result;
 use lance_index::IndexType;
+use lance_index::scalar::ScalarIndexParams;
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams;
@@ -57,6 +58,8 @@ const VECTOR_COL: &str = "vec";
 const VECTOR_INDEX_NAME: &str = "vec_idx";
 const TEXT_COL: &str = "text";
 const FTS_INDEX_NAME: &str = "text_fts";
+const ID_COL: &str = "id";
+const BTREE_INDEX_NAME: &str = "id_btree";
 const TEXT_BYTES: usize = 1_500;
 const ROW_BYTES_FINEWEB_SHAPE: usize = 5_760;
 const FINEWEB_FIXED_BYTES: usize = ROW_BYTES_FINEWEB_SHAPE - TEXT_BYTES - 1024 * size_of::<f32>();
@@ -105,27 +108,35 @@ impl Mode {
     }
 }
 
-/// Which index the MemTable maintains in the indexed (`*_idx`) modes.
-/// The backpressure methodology — paced ingest, WAL-queue sampling,
-/// skip-close — is identical for both; only the indexed column and the
-/// index built differ, so vector and FTS results are directly comparable.
+/// A secondary index the MemTable maintains and rebuilds on each flushed
+/// generation. The backpressure methodology — paced ingest, WAL-queue
+/// sampling, skip-close — is identical regardless of which indexes are
+/// configured; only the columns indexed and the per-flush index-build cost
+/// differ, so any subset is directly comparable. Post-cee7d32 the flush
+/// rebuilds these on the frozen generation, so they are the dominant flush
+/// cost we are re-evaluating here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexKind {
+    Btree,
     Vector,
     Fts,
 }
 
 impl IndexKind {
-    fn parse(value: &str) -> std::result::Result<Self, String> {
+    fn parse_one(value: &str) -> std::result::Result<Self, String> {
         match value {
+            "btree" => Ok(Self::Btree),
             "vector" => Ok(Self::Vector),
             "fts" => Ok(Self::Fts),
-            _ => Err(format!("unknown index-type '{value}', expected vector|fts")),
+            _ => Err(format!(
+                "unknown index '{value}', expected btree|vector|fts"
+            )),
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::Btree => "btree",
             Self::Vector => "vector",
             Self::Fts => "fts",
         }
@@ -133,9 +144,44 @@ impl IndexKind {
 
     fn index_name(self) -> &'static str {
         match self {
+            Self::Btree => BTREE_INDEX_NAME,
             Self::Vector => VECTOR_INDEX_NAME,
             Self::Fts => FTS_INDEX_NAME,
         }
+    }
+}
+
+/// Parse `--indexes`: `none` (empty set) or a `+`/`,`-joined set drawn from
+/// `btree`,`vector`,`fts`. Duplicates are de-duped while preserving order.
+fn parse_index_set(value: &str) -> std::result::Result<Vec<IndexKind>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return Ok(vec![]);
+    }
+    let mut out = Vec::new();
+    for tok in trimmed
+        .split(['+', ','])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let kind = IndexKind::parse_one(tok)?;
+        if !out.contains(&kind) {
+            out.push(kind);
+        }
+    }
+    Ok(out)
+}
+
+/// Stable label for a set of indexes, e.g. `none`, `btree+vector+fts`.
+fn index_set_label(indexes: &[IndexKind]) -> String {
+    if indexes.is_empty() {
+        "none".to_string()
+    } else {
+        indexes
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join("+")
     }
 }
 
@@ -178,7 +224,7 @@ impl SchemaShape {
 struct Args {
     uri: Option<String>,
     mode: Mode,
-    index_kind: IndexKind,
+    indexes: Vec<IndexKind>,
     schema_shape: SchemaShape,
     seed_rows: usize,
     batch_rows: usize,
@@ -195,6 +241,7 @@ struct Args {
     async_index_buffer_rows: usize,
     sample_interval_ms: u64,
     target_rows_per_sec: Option<f64>,
+    max_duration_s: f64,
     num_partitions: usize,
     num_sub_vectors: usize,
     threads: usize,
@@ -209,7 +256,7 @@ impl Default for Args {
         Self {
             uri: None,
             mode: Mode::AsyncIndexed,
-            index_kind: IndexKind::Vector,
+            indexes: vec![IndexKind::Vector],
             schema_shape: SchemaShape::FineWeb,
             seed_rows: 100_000,
             batch_rows: 1_000,
@@ -226,6 +273,7 @@ impl Default for Args {
             async_index_buffer_rows: 10_000,
             sample_interval_ms: 500,
             target_rows_per_sec: None,
+            max_duration_s: 0.0,
             num_partitions: 1,
             num_sub_vectors: 8,
             threads,
@@ -275,10 +323,10 @@ async fn run(args: Args) -> Result<()> {
     };
 
     println!(
-        "bench=mem_wal_shard_writer_backpressure uri={} mode={} index_type={} schema_shape={} seed_rows={} batch_rows={} calls={} vector_dim={} text_bytes={} row_bytes={} target_rows_per_sec={:?} max_memtable_size={} max_memtable_rows={} max_memtable_batches={} max_unflushed_memtable_bytes={} max_wal_buffer_size={} max_wal_flush_interval_ms={} rayon_threads={} tokio_threads={} skip_close={}",
+        "bench=mem_wal_shard_writer_backpressure uri={} mode={} indexes={} schema_shape={} seed_rows={} batch_rows={} calls={} vector_dim={} text_bytes={} row_bytes={} target_rows_per_sec={:?} max_duration_s={} max_memtable_size={} max_memtable_rows={} max_memtable_batches={} max_unflushed_memtable_bytes={} max_wal_buffer_size={} max_wal_flush_interval_ms={} rayon_threads={} tokio_threads={} skip_close={}",
         uri,
         args.mode.as_str(),
-        args.index_kind.as_str(),
+        index_set_label(&args.indexes),
         args.schema_shape.as_str(),
         args.seed_rows,
         args.batch_rows,
@@ -287,6 +335,7 @@ async fn run(args: Args) -> Result<()> {
         args.text_bytes,
         args.row_bytes,
         args.target_rows_per_sec,
+        args.max_duration_s,
         args.max_memtable_size,
         memtable_limits.rows,
         memtable_limits.batches,
@@ -314,8 +363,9 @@ async fn run(args: Args) -> Result<()> {
     let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default())).await?;
 
     let index_start = Instant::now();
-    if args.mode.indexed() {
-        match args.index_kind {
+    for kind in &args.indexes {
+        match kind {
+            IndexKind::Btree => create_base_btree_index(&mut dataset).await?,
             IndexKind::Vector => create_base_vector_index(&mut dataset, &args).await?,
             IndexKind::Fts => create_base_fts_index(&mut dataset).await?,
         }
@@ -324,11 +374,12 @@ async fn run(args: Args) -> Result<()> {
 
     dataset
         .initialize_mem_wal()
-        .maintained_indexes(if args.mode.indexed() {
-            vec![args.index_kind.index_name().to_string()]
-        } else {
-            vec![]
-        })
+        .maintained_indexes(
+            args.indexes
+                .iter()
+                .map(|kind| kind.index_name().to_string())
+                .collect::<Vec<_>>(),
+        )
         .execute()
         .await?;
 
@@ -413,9 +464,22 @@ async fn run(args: Args) -> Result<()> {
                 tokio::time::sleep(Duration::from_secs_f64(target_elapsed - actual_elapsed)).await;
             }
         }
+
+        // Stop early once the wall-clock budget is reached so capped runs
+        // still reach the finalize/output path (a `timeout` kill would lose
+        // the JSON). The active memtable keeps growing until the next
+        // size/row trigger, so steady-state flush behavior is unaffected.
+        if args.max_duration_s > 0.0 && puts_start.elapsed().as_secs_f64() >= args.max_duration_s {
+            break;
+        }
     }
     let elapsed_puts_s = puts_start.elapsed().as_secs_f64();
+    // Actual rows put may be < calls*batch_rows when a duration cap fired.
+    let completed_calls = latencies_ms.len();
     let final_memtable_stats = writer.memtable_stats().await.ok();
+    // Snapshot backpressure (put-blocking) activity before `close()` consumes
+    // the writer; no new puts run during close so this is the full picture.
+    let bp_stats = writer.backpressure_stats();
     push_sample(
         &mut samples,
         "puts_done",
@@ -444,7 +508,7 @@ async fn run(args: Args) -> Result<()> {
         (elapsed_drain_s, elapsed_total_s, stats)
     };
 
-    let rows = args.calls * args.batch_rows;
+    let rows = completed_calls * args.batch_rows;
     let puts_rows_s = rows as f64 / elapsed_puts_s;
     let total_rows_s = rows as f64 / elapsed_total_s;
     let puts_mb_s = puts_rows_s * args.row_bytes as f64 / 1_000_000.0;
@@ -480,10 +544,37 @@ async fn run(args: Args) -> Result<()> {
     let final_memtable_batches = final_memtable_stats
         .as_ref()
         .map_or(0, |stats| stats.batch_count);
+    let avg_memtable_flush_ms = if stats.memtable_flush_count > 0 {
+        stats.memtable_flush_time.as_secs_f64() * 1000.0 / stats.memtable_flush_count as f64
+    } else {
+        0.0
+    };
+    let final_memtable_mb = final_memtable_stats
+        .as_ref()
+        .map_or(0.0, |s| s.estimated_size as f64 / 1_000_000.0);
+    let final_frozen_count = final_memtable_stats
+        .as_ref()
+        .map_or(0, |s| s.frozen_memtable_count);
+    let final_unflushed_mb = final_memtable_stats
+        .as_ref()
+        .map_or(0.0, |s| s.unflushed_memtable_bytes as f64 / 1_000_000.0);
+    // Peak L0 flush backlog observed across put-phase samples — the clearest
+    // signal of memtable-flush backpressure building up over a long run.
+    let max_frozen_count = samples
+        .iter()
+        .filter_map(|s| s.get("frozen_memtable_count").and_then(|v| v.as_u64()))
+        .max()
+        .unwrap_or(0);
+    let max_unflushed_bytes = samples
+        .iter()
+        .filter_map(|s| s.get("unflushed_memtable_bytes").and_then(|v| v.as_u64()))
+        .max()
+        .unwrap_or(0);
 
     println!(
-        "result mode={} rows={} result_rows_s={:.1} result_mb_s={:.2} puts_rows_s={:.1} drained_rows_s={:.1} puts_mb_s={:.2} drained_mb_s={:.2} setup_s={:.3} index_setup_s={:.3} batch_build_s={:.3} puts_s={:.3} drain_s={:.3} total_s={:.3} skip_close={} p50_ms={:.2} p90_ms={:.2} p99_ms={:.2} slow_puts_1s={} slow_puts_10s={} wal_flushes={} final_wal_pending_batches={} final_wal_pending_rows={} final_wal_pending_mb={:.2} final_memtable_rows={} final_memtable_batches={} index_update_s={:.3} memtable_flush_s={:.3}",
+        "result mode={} indexes={} rows={} result_rows_s={:.1} result_mb_s={:.2} puts_rows_s={:.1} drained_rows_s={:.1} puts_mb_s={:.2} drained_mb_s={:.2} setup_s={:.3} index_setup_s={:.3} batch_build_s={:.3} puts_s={:.3} drain_s={:.3} total_s={:.3} skip_close={} p50_ms={:.2} p90_ms={:.2} p99_ms={:.2} slow_puts_1s={} slow_puts_10s={} wal_flushes={} final_wal_pending_batches={} final_wal_pending_rows={} final_wal_pending_mb={:.2} final_memtable_rows={} final_memtable_batches={} index_update_s={:.3} memtable_flush_s={:.3} memtable_flush_count={} avg_memtable_flush_ms={:.1} final_memtable_mb={:.2} final_frozen_count={} final_unflushed_mb={:.2} max_frozen_count={} bp_count={} bp_wait_ms={}",
         args.mode.as_str(),
+        index_set_label(&args.indexes),
         rows,
         result_rows_s,
         result_mb_s,
@@ -511,16 +602,26 @@ async fn run(args: Args) -> Result<()> {
         final_memtable_batches,
         stats.index_update_time.as_secs_f64(),
         stats.memtable_flush_time.as_secs_f64(),
+        stats.memtable_flush_count,
+        avg_memtable_flush_ms,
+        final_memtable_mb,
+        final_frozen_count,
+        final_unflushed_mb,
+        max_frozen_count,
+        bp_stats.total_count,
+        bp_stats.total_wait_ms,
     );
 
     let output = json!({
         "uri": uri,
         "mode": args.mode.as_str(),
-        "index_type": args.index_kind.as_str(),
+        "indexes": index_set_label(&args.indexes),
         "schema_shape": args.schema_shape.as_str(),
         "seed_rows": args.seed_rows,
         "batch_rows": args.batch_rows,
         "calls": args.calls,
+        "completed_calls": completed_calls,
+        "max_duration_s": args.max_duration_s,
         "total_rows_written": rows,
         "vector_dim": args.vector_dim,
         "text_bytes": args.text_bytes,
@@ -556,6 +657,16 @@ async fn run(args: Args) -> Result<()> {
         "p99_ms": p99_ms,
         "slow_puts_1s": slow_puts_1s,
         "slow_puts_10s": slow_puts_10s,
+        "avg_memtable_flush_ms": avg_memtable_flush_ms,
+        "final_memtable_bytes": final_memtable_stats.as_ref().map(|s| s.estimated_size),
+        "final_frozen_memtable_count": final_frozen_count,
+        "final_unflushed_memtable_bytes": final_memtable_stats.as_ref().map(|s| s.unflushed_memtable_bytes),
+        "max_frozen_memtable_count": max_frozen_count,
+        "max_unflushed_memtable_bytes_observed": max_unflushed_bytes,
+        "backpressure": {
+            "count": bp_stats.total_count,
+            "total_wait_ms": bp_stats.total_wait_ms,
+        },
         "final_memtable_stats": memtable_stats_json(final_memtable_stats.as_ref()),
         "puts": puts,
         "samples": samples,
@@ -585,6 +696,19 @@ async fn run(args: Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn create_base_btree_index(dataset: &mut Dataset) -> Result<()> {
+    dataset
+        .create_index(
+            &[ID_COL],
+            IndexType::BTree,
+            Some(BTREE_INDEX_NAME.to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .map(|_| ())
 }
 
 async fn create_base_vector_index(dataset: &mut Dataset, args: &Args) -> Result<()> {
@@ -648,6 +772,9 @@ fn push_sample(
         "wal_queue_pending_bytes": memtable.as_ref().map(|stats| stats.pending_wal_estimated_bytes),
         "wal_queue_pending_start_batch_position": memtable.as_ref().and_then(|stats| stats.pending_wal_start_batch_position),
         "wal_queue_pending_end_batch_position": memtable.as_ref().and_then(|stats| stats.pending_wal_end_batch_position),
+        "frozen_memtable_bytes": memtable.as_ref().map(|stats| stats.frozen_memtable_bytes),
+        "frozen_memtable_count": memtable.as_ref().map(|stats| stats.frozen_memtable_count),
+        "unflushed_memtable_bytes": memtable.as_ref().map(|stats| stats.unflushed_memtable_bytes),
     }));
 }
 
@@ -665,6 +792,9 @@ fn memtable_stats_json(memtable: Option<&MemTableStats>) -> serde_json::Value {
             "wal_queue_pending_batches": stats.pending_wal_batch_count,
             "wal_queue_pending_rows": stats.pending_wal_row_count,
             "wal_queue_pending_bytes": stats.pending_wal_estimated_bytes,
+            "frozen_memtable_bytes": stats.frozen_memtable_bytes,
+            "frozen_memtable_count": stats.frozen_memtable_count,
+            "unflushed_memtable_bytes": stats.unflushed_memtable_bytes,
         }),
         None => serde_json::Value::Null,
     }
@@ -924,6 +1054,10 @@ fn effective_memtable_limits(args: &Args) -> EffectiveMemTableLimits {
 fn parse_args() -> Result<Args> {
     let mut args = Args::default();
     let mut row_bytes_explicit = false;
+    // `--indexes` (a set) takes precedence over the legacy single `--index-type`
+    // alias; if neither is given we fall back to the mode-derived default below.
+    let mut explicit_indexes: Option<Vec<IndexKind>> = None;
+    let mut index_type_alias: Option<IndexKind> = None;
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
         if flag == "--bench" {
@@ -941,9 +1075,13 @@ fn parse_args() -> Result<Args> {
             "--mode" => {
                 args.mode = Mode::parse(&value).map_err(lance_core::Error::invalid_input)?;
             }
+            "--indexes" => {
+                explicit_indexes =
+                    Some(parse_index_set(&value).map_err(lance_core::Error::invalid_input)?);
+            }
             "--index-type" => {
-                args.index_kind =
-                    IndexKind::parse(&value).map_err(lance_core::Error::invalid_input)?;
+                index_type_alias =
+                    Some(IndexKind::parse_one(&value).map_err(lance_core::Error::invalid_input)?);
             }
             "--schema-shape" => {
                 args.schema_shape =
@@ -975,6 +1113,7 @@ fn parse_args() -> Result<Args> {
             "--async-index-buffer-rows" => args.async_index_buffer_rows = parse(&flag, &value)?,
             "--sample-interval-ms" => args.sample_interval_ms = parse(&flag, &value)?,
             "--target-rows-per-sec" => args.target_rows_per_sec = Some(parse(&flag, &value)?),
+            "--max-duration-s" => args.max_duration_s = parse(&flag, &value)?,
             "--num-partitions" => args.num_partitions = parse(&flag, &value)?,
             "--num-sub-vectors" => args.num_sub_vectors = parse(&flag, &value)?,
             "--threads" => args.threads = parse(&flag, &value)?,
@@ -993,6 +1132,20 @@ fn parse_args() -> Result<Args> {
             .schema_shape
             .default_row_bytes(args.vector_dim, args.text_bytes);
     }
+
+    // Resolve which indexes to maintain: explicit `--indexes` wins, else the
+    // single `--index-type` alias, else derive from the mode (indexed modes
+    // default to a vector index, no-index modes to none) for back-compat with
+    // the existing sweep script.
+    args.indexes = explicit_indexes
+        .or_else(|| index_type_alias.map(|kind| vec![kind]))
+        .unwrap_or_else(|| {
+            if args.mode.indexed() {
+                vec![IndexKind::Vector]
+            } else {
+                vec![]
+            }
+        });
 
     if args.seed_rows == 0
         || args.batch_rows == 0
@@ -1019,21 +1172,15 @@ fn parse_args() -> Result<Args> {
             max_memtable_rows, args.batch_rows
         )));
     }
-    if args.mode.indexed()
-        && args.index_kind == IndexKind::Vector
-        && args.vector_dim % args.num_sub_vectors != 0
-    {
+    if args.indexes.contains(&IndexKind::Vector) && args.vector_dim % args.num_sub_vectors != 0 {
         return Err(lance_core::Error::invalid_input(format!(
             "vector_dim must be divisible by num_sub_vectors for IVF_PQ: vector_dim={}, num_sub_vectors={}",
             args.vector_dim, args.num_sub_vectors
         )));
     }
-    if args.mode.indexed()
-        && args.index_kind == IndexKind::Fts
-        && args.schema_shape != SchemaShape::FineWeb
-    {
+    if args.indexes.contains(&IndexKind::Fts) && args.schema_shape != SchemaShape::FineWeb {
         return Err(lance_core::Error::invalid_input(
-            "index-type=fts requires schema-shape=fineweb (it has the text column)",
+            "indexes containing fts require schema-shape=fineweb (it has the text column)",
         ));
     }
 
