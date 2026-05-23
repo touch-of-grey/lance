@@ -13,11 +13,17 @@ storage_base_uri() {
     esac
 }
 
-# No-index combos use async_noidx so no in-memory index is maintained; any
-# non-empty combo uses async_idx (async incremental in-memory indexing + the
-# persisted index rebuilt at flush).
+# Pick the write mode. With SYNC=1 the in-memory index is built inline with each
+# put (so it is fully present when we snapshot index memory — used by the
+# flush-cost experiment). With SYNC=0 (default) indexing is async, the realistic
+# sustained-ingest path used by the backpressure experiment.
 mode_for_combo() {
-    if [ "$1" = "none" ]; then echo "async_noidx"; else echo "async_idx"; fi
+    local sync="${SYNC:-0}"
+    if [ "$1" = "none" ]; then
+        [ "$sync" = "1" ] && echo "sync_noidx" || echo "async_noidx"
+    else
+        [ "$sync" = "1" ] && echo "sync_idx" || echo "async_idx"
+    fi
 }
 
 # Filesystem/S3-safe cell label: '+' in combos becomes '-'.

@@ -484,32 +484,6 @@ async fn run(args: Args) -> Result<()> {
     // Actual rows put may be < calls*batch_rows when a duration cap fired.
     let completed_calls = latencies_ms.len();
 
-    // Flush-cost (close) runs only: `put` returns as soon as data is buffered,
-    // so the async in-memory index keeps building afterwards. Wait until that
-    // build quiesces (index_update_rows stops advancing) before snapshotting,
-    // so `index_memory_bytes` reflects the full index and the close()-measured
-    // flush time covers only the persisted flush, not the in-memory build.
-    let mut index_build_s = 0.0_f64;
-    if !args.skip_close && !args.indexes.is_empty() {
-        let wait_start = Instant::now();
-        let mut last_rows = stats_handle.snapshot().index_update_rows;
-        let mut stable_since = Instant::now();
-        loop {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let cur = stats_handle.snapshot().index_update_rows;
-            if cur > last_rows {
-                last_rows = cur;
-                stable_since = Instant::now();
-            }
-            if stable_since.elapsed() >= Duration::from_secs(3)
-                || wait_start.elapsed() >= Duration::from_secs(900)
-            {
-                break;
-            }
-        }
-        index_build_s = wait_start.elapsed().as_secs_f64();
-    }
-
     let final_memtable_stats = writer.memtable_stats().await.ok();
     // Snapshot backpressure (put-blocking) activity before `close()` consumes
     // the writer; no new puts run during close so this is the full picture.
@@ -610,7 +584,7 @@ async fn run(args: Args) -> Result<()> {
         .unwrap_or(0);
 
     println!(
-        "result mode={} indexes={} rows={} result_rows_s={:.1} result_mb_s={:.2} puts_rows_s={:.1} drained_rows_s={:.1} puts_mb_s={:.2} drained_mb_s={:.2} setup_s={:.3} index_setup_s={:.3} batch_build_s={:.3} puts_s={:.3} drain_s={:.3} total_s={:.3} skip_close={} p50_ms={:.2} p90_ms={:.2} p99_ms={:.2} slow_puts_1s={} slow_puts_10s={} wal_flushes={} final_wal_pending_batches={} final_wal_pending_rows={} final_wal_pending_mb={:.2} final_memtable_rows={} final_memtable_batches={} index_update_s={:.3} memtable_flush_s={:.3} memtable_flush_count={} avg_memtable_flush_ms={:.1} final_memtable_mb={:.2} final_frozen_count={} final_unflushed_mb={:.2} max_frozen_count={} bp_count={} bp_wait_ms={} index_memory_mb={:.1} flushed_gen_mb={:.1} index_build_s={:.1}",
+        "result mode={} indexes={} rows={} result_rows_s={:.1} result_mb_s={:.2} puts_rows_s={:.1} drained_rows_s={:.1} puts_mb_s={:.2} drained_mb_s={:.2} setup_s={:.3} index_setup_s={:.3} batch_build_s={:.3} puts_s={:.3} drain_s={:.3} total_s={:.3} skip_close={} p50_ms={:.2} p90_ms={:.2} p99_ms={:.2} slow_puts_1s={} slow_puts_10s={} wal_flushes={} final_wal_pending_batches={} final_wal_pending_rows={} final_wal_pending_mb={:.2} final_memtable_rows={} final_memtable_batches={} index_update_s={:.3} memtable_flush_s={:.3} memtable_flush_count={} avg_memtable_flush_ms={:.1} final_memtable_mb={:.2} final_frozen_count={} final_unflushed_mb={:.2} max_frozen_count={} bp_count={} bp_wait_ms={} index_memory_mb={:.1} flushed_gen_mb={:.1}",
         args.mode.as_str(),
         index_set_label(&args.indexes),
         rows,
@@ -650,7 +624,6 @@ async fn run(args: Args) -> Result<()> {
         bp_stats.total_wait_ms,
         index_memory_bytes.unwrap_or(0) as f64 / 1_000_000.0,
         flushed_gen_bytes.unwrap_or(0) as f64 / 1_000_000.0,
-        index_build_s,
     );
 
     let output = json!({
@@ -706,7 +679,6 @@ async fn run(args: Args) -> Result<()> {
         "max_unflushed_memtable_bytes_observed": max_unflushed_bytes,
         "index_memory_bytes": index_memory_bytes,
         "flushed_generation_bytes": flushed_gen_bytes,
-        "index_build_seconds": index_build_s,
         "backpressure": {
             "count": bp_stats.total_count,
             "total_wait_ms": bp_stats.total_wait_ms,

@@ -37,6 +37,9 @@ SEED_ROWS="${SEED_ROWS:-5000}"
 VECTOR_DIM="${VECTOR_DIM:-1024}"
 THREADS="${THREADS:-$(nproc 2>/dev/null || echo 8)}"
 CLEANUP="${CLEANUP:-1}"
+# Build the in-memory index synchronously so index-memory is fully present when
+# snapshotted (flush cost itself is mode-independent). Backpressure exp uses async.
+SYNC="${SYNC:-1}"
 # Hard per-cell wall-clock kill. A flush that panics (e.g. the HNSW index
 # write at scale) deadlocks close(); without this the whole sweep would hang.
 CELL_TIMEOUT="${CELL_TIMEOUT:-1800}"
