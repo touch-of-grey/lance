@@ -1254,6 +1254,7 @@ mod tests {
     #[tokio::test]
     async fn test_flusher_hnsw_large_generation_does_not_overflow_chunk() {
         use super::super::super::index::IndexStore;
+        use crate::index::DatasetIndexExt;
         use arrow_array::{FixedSizeListArray, Float32Array};
         use lance_linalg::distance::DistanceType;
 
