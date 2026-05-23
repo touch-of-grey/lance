@@ -49,7 +49,9 @@ upload_and_cleanup() {
     [ -f "$out" ] && aws s3 cp "$out" "${results_prefix}.json" >/dev/null 2>&1
     aws s3 cp "$log" "${results_prefix}.log" >/dev/null 2>&1
     if [ "${CLEANUP:-1}" = "1" ] && [[ "$dataset_uri" == s3://* ]]; then
-        aws s3 rm --recursive "$dataset_uri" >/dev/null 2>&1
+        # Trailing slash so a cell URI is never a string-prefix of another
+        # (e.g. .../s3_btree_100000 vs .../s3_btree_1000000).
+        aws s3 rm --recursive "${dataset_uri%/}/" >/dev/null 2>&1
     fi
 }
 

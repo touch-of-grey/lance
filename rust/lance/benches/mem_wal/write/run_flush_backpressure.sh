@@ -69,6 +69,12 @@ for storage in $STORAGES; do
         for size in $SIZES; do
             calls=$(( FLUSHES * size / BATCH_ROWS ))
             unflushed=$(( UNFLUSHED_MULT * size * ROW_BYTES ))
+            # The memtable freezes on batch-store fullness (rows is only the
+            # index pre-alloc capacity), so pin the batch limit to flush at
+            # EXACTLY `size` rows. Give the row capacity a little headroom so
+            # the in-memory vector index never exhausts before the freeze.
+            flush_batches=$(( size / BATCH_ROWS ))
+            mt_rows_cap=$(( size + 64 * BATCH_ROWS ))
             label="$(cell_label "$storage" "$combo" "$size")"
             out="$LOCAL_DIR/${label}.json"; log="$LOCAL_DIR/${label}.log"
             uri="$base_uri/$RUN_ID/${label}"
@@ -80,7 +86,8 @@ for storage in $STORAGES; do
                 --seed-rows "$SEED_ROWS" --batch-rows "$BATCH_ROWS" --calls "$calls" \
                 --vector-dim "$VECTOR_DIM" \
                 --max-memtable-size "$HUGE_BYTES" \
-                --max-memtable-rows "$size" \
+                --max-memtable-rows "$mt_rows_cap" \
+                --max-memtable-batches "$flush_batches" \
                 --max-unflushed-memtable-bytes "$unflushed" \
                 --max-wal-buffer-size 52428800 \
                 --max-wal-flush-interval-ms 0 \
