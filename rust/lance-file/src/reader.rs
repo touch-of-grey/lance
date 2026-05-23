@@ -1718,8 +1718,12 @@ mod tests {
         use arrow_schema::Schema as ArrowSchema;
         use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 
+        // HNSW shape: ~40k dense level-0 lists then mostly-empty higher-level
+        // rows (most nodes have no neighbors above level 0).
         let num_rows = 280_000usize;
-        let lengths: Vec<i32> = (0..num_rows).map(|i| 1 + (i % 40) as i32).collect();
+        let lengths: Vec<i32> = (0..num_rows)
+            .map(|i| if i < 40_000 { 1 + (i % 40) as i32 } else { 0 })
+            .collect();
         let mut offsets = Vec::with_capacity(num_rows + 1);
         let mut acc = 0i32;
         offsets.push(0);
@@ -1746,10 +1750,15 @@ mod tests {
             )),
             None,
         );
+        let fullzip = std::collections::HashMap::from([(
+            lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.to_string(),
+            lance_encoding::constants::STRUCTURAL_ENCODING_FULLZIP.to_string(),
+        )]);
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("vector_id", DataType::UInt32, false),
-            Field::new("__neighbors", DataType::List(u32_item), true),
-            Field::new("__dists", DataType::List(f32_item), true),
+            Field::new("__neighbors", DataType::List(u32_item), true)
+                .with_metadata(fullzip.clone()),
+            Field::new("__dists", DataType::List(f32_item), true).with_metadata(fullzip),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),

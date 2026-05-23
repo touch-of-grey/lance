@@ -367,21 +367,6 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             .into_iter()
             .map(|task| task.decode())
             .collect::<Result<Vec<_>>>()?;
-        if arrays
-            .iter()
-            .any(|a| a.array.len() != arrays[0].array.len())
-        {
-            eprintln!(
-                "STRUCT_DECODE_DIAG num_rows={} is_root={} child_lens_types=[{}]",
-                self.num_rows,
-                self.is_root,
-                arrays
-                    .iter()
-                    .map(|a| format!("{}:{}", a.array.len(), a.array.data_type()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
         let mut children = Vec::with_capacity(arrays.len());
         let mut data_size = 0u64;
         let mut arrays_iter = arrays.into_iter();
