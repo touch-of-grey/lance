@@ -37,6 +37,9 @@ SEED_ROWS="${SEED_ROWS:-5000}"
 VECTOR_DIM="${VECTOR_DIM:-1024}"
 THREADS="${THREADS:-$(nproc 2>/dev/null || echo 8)}"
 CLEANUP="${CLEANUP:-1}"
+# Hard per-cell wall-clock kill. A flush that panics (e.g. the HNSW index
+# write at scale) deadlocks close(); without this the whole sweep would hang.
+CELL_TIMEOUT="${CELL_TIMEOUT:-1800}"
 
 # Memtable limits set huge so the ONLY flush is the one close() forces.
 HUGE_BYTES=1099511627776   # 1 TiB
@@ -64,7 +67,7 @@ for storage in $STORAGES; do
             uri="$base_uri/$RUN_ID/${label}"
             echo ">>> $label (mode=$mode calls=$calls)"
             if [ -f "$out" ]; then echo "    already done"; continue; fi
-            "$BIN" --bench \
+            timeout "$CELL_TIMEOUT" "$BIN" --bench \
                 --mode "$mode" --indexes "$combo" --schema-shape fineweb \
                 --uri "$uri" \
                 --seed-rows "$SEED_ROWS" --batch-rows "$BATCH_ROWS" --calls "$calls" \
@@ -79,7 +82,9 @@ for storage in $STORAGES; do
                 --threads "$THREADS" --tokio-threads "$THREADS" \
                 --output "$out" > "$log" 2>&1
             rc=$?
-            if [ "$rc" -ne 0 ]; then echo "    !!! failed rc=$rc (see $log)"; else echo "    ok"; fi
+            if [ "$rc" -eq 124 ]; then echo "    !!! TIMED OUT after ${CELL_TIMEOUT}s (likely flush panic/hang)"
+            elif [ "$rc" -ne 0 ]; then echo "    !!! failed rc=$rc (see $log)"
+            else echo "    ok"; fi
             upload_and_cleanup "$out" "$log" "$base_uri/$RUN_ID/results/${label}" "$uri"
         done
     done

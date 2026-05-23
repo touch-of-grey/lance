@@ -585,7 +585,8 @@ impl MemTableFlusher {
         use arrow_schema::Schema as ArrowSchema;
         use lance_arrow::FixedSizeListArrayExt;
         use lance_core::ROW_ID;
-        use lance_file::writer::FileWriter;
+        use lance_file::version::LanceFileVersion;
+        use lance_file::writer::{FileWriter, FileWriterOptions};
         use lance_index::pb;
         use lance_index::vector::DISTANCE_TYPE_KEY;
         use lance_index::vector::SQ_CODE_COLUMN;
@@ -670,11 +671,22 @@ impl MemTableFlusher {
             lance_index::vector::ivf::storage::IvfModel::new(zero_centroid_fsl.clone(), None);
         storage_ivf.add_partition(storage_batch.num_rows() as u32);
 
+        // Write the HNSW index files at format v2.2 so the structural encoder's
+        // miniblock layout uses u32 chunk sizes (4 GiB cap). At v2.1 the u16 cap
+        // (32 KiB) cannot represent the graph's List<u32>/List<f32> chunks once a
+        // flushed generation has more than ~32k nodes — the encoder trips a
+        // `chunk_bytes <= max_chunk_size` assertion mid-flush, which kills the
+        // flush task and deadlocks close(). v2.2 is a stable, readable version.
+        let index_writer_options = || FileWriterOptions {
+            format_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+
         let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         let mut storage_writer = FileWriter::try_new(
             self.object_store.create(&storage_path).await?,
             (&storage_schema).try_into()?,
-            Default::default(),
+            index_writer_options(),
         )?;
         storage_writer.write_batch(&storage_batch).await?;
 
@@ -721,7 +733,7 @@ impl MemTableFlusher {
         let mut index_writer = FileWriter::try_new(
             self.object_store.create(&index_path).await?,
             (&index_schema).try_into()?,
-            Default::default(),
+            index_writer_options(),
         )?;
         index_writer.write_batch(&hnsw_batch).await?;
 

@@ -45,6 +45,10 @@ VECTOR_DIM="${VECTOR_DIM:-1024}"
 ROW_BYTES="${ROW_BYTES:-5760}"
 THREADS="${THREADS:-$(nproc 2>/dev/null || echo 8)}"
 CLEANUP="${CLEANUP:-1}"
+# Hard per-cell kill = duration cap + slack. A background flush that panics
+# (e.g. HNSW index write at scale) stalls puts on backpressure forever, so the
+# graceful --max-duration-s break can never fire; this guarantees progress.
+CELL_TIMEOUT="${CELL_TIMEOUT:-$(( MAX_DURATION_S + 300 ))}"
 
 HUGE_BYTES=1099511627776   # 1 TiB — size never triggers; row count N is the trigger
 
@@ -70,7 +74,7 @@ for storage in $STORAGES; do
             uri="$base_uri/$RUN_ID/${label}"
             echo ">>> $label (mode=$mode calls=$calls unflushed=$((unflushed/1000000))MB cap=${MAX_DURATION_S}s)"
             if [ -f "$out" ]; then echo "    already done"; continue; fi
-            "$BIN" --bench \
+            timeout "$CELL_TIMEOUT" "$BIN" --bench \
                 --mode "$mode" --indexes "$combo" --schema-shape fineweb \
                 --uri "$uri" \
                 --seed-rows "$SEED_ROWS" --batch-rows "$BATCH_ROWS" --calls "$calls" \
@@ -86,7 +90,9 @@ for storage in $STORAGES; do
                 --skip-close \
                 --output "$out" > "$log" 2>&1
             rc=$?
-            if [ "$rc" -ne 0 ]; then echo "    !!! failed rc=$rc (see $log)"; else echo "    ok"; fi
+            if [ "$rc" -eq 124 ]; then echo "    !!! TIMED OUT after ${CELL_TIMEOUT}s (likely flush panic/hang)"
+            elif [ "$rc" -ne 0 ]; then echo "    !!! failed rc=$rc (see $log)"
+            else echo "    ok"; fi
             upload_and_cleanup "$out" "$log" "$base_uri/$RUN_ID/results/${label}" "$uri"
         done
     done

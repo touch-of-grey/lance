@@ -57,9 +57,12 @@ summarize_flush_cost() {
     python3 - "$1" <<'PY'
 import glob, json, os, sys
 d = sys.argv[1]
+# flush_s   = persisted L0 write + persisted index build (the cee7d32 change)
+# idx_upd_s = in-memory index build streamed during puts (HNSW/FTS/btree in RAM)
+# drain_s   = total close() wall time (final WAL flush + freeze + flush)
 print(f"{'cell':40s} {'indexes':22s} {'rows':>9s} {'memtable_MB':>11s} "
-      f"{'flush_s':>8s} {'avg_flush_ms':>12s} {'flush_MB/s':>10s} "
-      f"{'idx_setup_s':>11s} {'drain_s':>8s}")
+      f"{'puts_s':>8s} {'idx_upd_s':>9s} {'flush_s':>8s} {'avg_flush_ms':>12s} "
+      f"{'flush_MB/s':>10s} {'drain_s':>8s}")
 for p in sorted(glob.glob(os.path.join(d, "*.json"))):
     try: r = json.load(open(p))
     except Exception: continue
@@ -72,8 +75,10 @@ for p in sorted(glob.glob(os.path.join(d, "*.json"))):
     rb = r.get("row_bytes", 0)
     flush_mbps = (rows * rb / 1e6 / flush_s) if flush_s > 0 else 0.0
     print(f"{name:40s} {r.get('indexes',''):22s} {rows:>9d} {mt_mb:>11.1f} "
+          f"{r.get('elapsed_puts_seconds',0):>8.2f} "
+          f"{ws.get('index_update_time_seconds',0):>9.2f} "
           f"{flush_s:>8.2f} {avg_ms:>12.1f} {flush_mbps:>10.1f} "
-          f"{r.get('index_setup_seconds',0):>11.2f} {r.get('elapsed_drain_seconds',0):>8.2f}")
+          f"{r.get('elapsed_drain_seconds',0):>8.2f}")
 PY
 }
 
