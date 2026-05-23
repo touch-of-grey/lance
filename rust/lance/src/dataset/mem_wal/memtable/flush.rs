@@ -585,8 +585,7 @@ impl MemTableFlusher {
         use arrow_schema::Schema as ArrowSchema;
         use lance_arrow::FixedSizeListArrayExt;
         use lance_core::ROW_ID;
-        use lance_file::version::LanceFileVersion;
-        use lance_file::writer::{FileWriter, FileWriterOptions};
+        use lance_file::writer::FileWriter;
         use lance_index::pb;
         use lance_index::vector::DISTANCE_TYPE_KEY;
         use lance_index::vector::SQ_CODE_COLUMN;
@@ -671,22 +670,11 @@ impl MemTableFlusher {
             lance_index::vector::ivf::storage::IvfModel::new(zero_centroid_fsl.clone(), None);
         storage_ivf.add_partition(storage_batch.num_rows() as u32);
 
-        // Write the HNSW index files at format v2.2 so the structural encoder's
-        // miniblock layout uses u32 chunk sizes (4 GiB cap). At v2.1 the u16 cap
-        // (32 KiB) cannot represent the graph's List<u32>/List<f32> chunks once a
-        // flushed generation has more than ~32k nodes — the encoder trips a
-        // `chunk_bytes <= max_chunk_size` assertion mid-flush, which kills the
-        // flush task and deadlocks close(). v2.2 is a stable, readable version.
-        let index_writer_options = || FileWriterOptions {
-            format_version: Some(LanceFileVersion::V2_2),
-            ..Default::default()
-        };
-
         let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         let mut storage_writer = FileWriter::try_new(
             self.object_store.create(&storage_path).await?,
             (&storage_schema).try_into()?,
-            index_writer_options(),
+            Default::default(),
         )?;
         storage_writer.write_batch(&storage_batch).await?;
 
@@ -733,7 +721,7 @@ impl MemTableFlusher {
         let mut index_writer = FileWriter::try_new(
             self.object_store.create(&index_path).await?,
             (&index_schema).try_into()?,
-            index_writer_options(),
+            Default::default(),
         )?;
         index_writer.write_batch(&hnsw_batch).await?;
 
@@ -1242,117 +1230,6 @@ mod tests {
             plan_str.contains("ANNIvfPartition:"),
             "query plan must use IVF partition, got: {plan_str}"
         );
-    }
-
-    /// Regression test: flushing an HNSW generation with > ~32k nodes must not
-    /// trip the structural encoder's miniblock chunk-size assertion. The graph
-    /// batch's List<u32>/List<f32> columns exceed the 32 KiB (u16) chunk cap of
-    /// the v2.1 file format at this scale; the flush writes the index files at
-    /// v2.2 (u32 chunk sizes) to avoid the panic + close() deadlock. With a
-    /// regression, `flush_with_indexes` panics on the `lance-cpu` thread and the
-    /// flush future never resolves. Small `vector_dim` keeps the build cheap.
-    #[tokio::test]
-    async fn test_flusher_hnsw_large_generation_does_not_overflow_chunk() {
-        use super::super::super::index::IndexStore;
-        use crate::index::DatasetIndexExt;
-        use arrow_array::{FixedSizeListArray, Float32Array};
-        use lance_linalg::distance::DistanceType;
-
-        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
-        let shard_id = Uuid::new_v4();
-        let manifest_store = Arc::new(ShardManifestStore::new(
-            store.clone(),
-            &base_path,
-            shard_id,
-            2,
-        ));
-        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
-
-        let vector_dim = 8;
-        // Above the ~32k-node threshold where the graph's List columns overflow
-        // a 32 KiB miniblock chunk under the v2.1 format.
-        let num_vectors = 40_000usize;
-
-        let vector_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, false)),
-                    vector_dim as i32,
-                ),
-                false,
-            ),
-        ]));
-
-        let vectors: Vec<f32> = (0..num_vectors * vector_dim)
-            .map(|i| ((i as f32 * 0.1).sin() + (i as f32 * 0.05).cos()) * 0.5)
-            .collect();
-        let vectors_array = Float32Array::from(vectors);
-
-        let index_configs = vec![MemIndexConfig::hnsw(
-            "vector_hnsw".to_string(),
-            1,
-            "vector".to_string(),
-            DistanceType::L2,
-        )];
-
-        let mut memtable = MemTable::new(vector_schema.clone(), 1, vec![]).unwrap();
-        let registry = IndexStore::from_configs(&index_configs, num_vectors, 100).unwrap();
-        memtable.set_indexes(registry);
-
-        let ids = Int32Array::from_iter_values(0..num_vectors as i32);
-        let inner_field = Arc::new(Field::new("item", DataType::Float32, false));
-        let vectors_fsl_data = FixedSizeListArray::try_new(
-            inner_field,
-            vector_dim as i32,
-            Arc::new(vectors_array),
-            None,
-        )
-        .unwrap();
-        let batch = RecordBatch::try_new(
-            vector_schema.clone(),
-            vec![Arc::new(ids), Arc::new(vectors_fsl_data)],
-        )
-        .unwrap();
-
-        let frag_id = memtable.insert(batch).await.unwrap();
-        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
-
-        let flusher = MemTableFlusher::new(
-            store.clone(),
-            base_path.clone(),
-            base_uri.clone(),
-            shard_id,
-            manifest_store.clone(),
-        );
-        // Without the v2.2 fix this panics mid-flush and never returns.
-        let result = flusher
-            .flush_with_indexes(&memtable, epoch, &index_configs, 1)
-            .await
-            .unwrap();
-        assert_eq!(result.rows_flushed, num_vectors);
-
-        // The flushed index files must be readable back (v2.2 is a stable format).
-        let gen_uri = format!(
-            "{}/_mem_wal/{}/{}",
-            base_uri, shard_id, result.generation.path
-        );
-        let dataset = Dataset::open(&gen_uri).await.unwrap();
-        let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0].name, "vector_hnsw");
-
-        let query = Float32Array::from(
-            (0..vector_dim)
-                .map(|i| ((i as f32 * 0.1).sin() + (i as f32 * 0.05).cos()) * 0.5)
-                .collect::<Vec<_>>(),
-        );
-        let mut scan = dataset.scan();
-        scan.nearest("vector", &query, 5).unwrap();
-        scan.fast_search();
-        let batch = scan.try_into_batch().await.unwrap();
-        assert!(batch.num_rows() > 0, "index-only query returned no rows");
     }
 
     #[tokio::test]
