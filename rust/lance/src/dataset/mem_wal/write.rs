@@ -1664,6 +1664,16 @@ impl ShardWriter {
         self.stats.clone()
     }
 
+    /// Snapshot of backpressure activity (how often and how long `put` blocked
+    /// waiting for unflushed bytes to drain below `max_unflushed_memtable_bytes`).
+    /// Available in both MemTable and WAL-only modes.
+    pub fn backpressure_stats(&self) -> BackpressureStatsSnapshot {
+        match &self.mode {
+            WriterMode::MemTable { backpressure, .. } => backpressure.stats().snapshot(),
+            WriterMode::WalOnly { backpressure, .. } => backpressure.stats().snapshot(),
+        }
+    }
+
     /// Get the current shard manifest.
     pub async fn manifest(&self) -> Result<Option<ShardManifest>> {
         self.manifest_store.read_latest().await
@@ -1691,10 +1701,12 @@ impl ShardWriter {
         let state = state_lock.read().await;
         let batch_store = state.memtable.batch_store();
         let pending_wal = batch_store.pending_wal_flush_stats();
+        let active_bytes = state.memtable.estimated_size();
+        let frozen_memtable_bytes = state.frozen_memtable_bytes;
         Ok(MemTableStats {
             row_count: state.memtable.row_count(),
             batch_count: state.memtable.batch_count(),
-            estimated_size: state.memtable.estimated_size(),
+            estimated_size: active_bytes,
             generation: state.memtable.generation(),
             max_buffered_batch_position: batch_store.max_buffered_batch_position(),
             max_flushed_batch_position: batch_store.max_flushed_batch_position(),
@@ -1703,6 +1715,10 @@ impl ShardWriter {
             pending_wal_batch_count: pending_wal.batch_count,
             pending_wal_row_count: pending_wal.row_count,
             pending_wal_estimated_bytes: pending_wal.estimated_bytes,
+            frozen_memtable_bytes,
+            frozen_memtable_count: state.frozen_flush_watchers.len(),
+            unflushed_memtable_bytes: active_bytes + frozen_memtable_bytes,
+            index_memory_bytes: state.memtable.index_memory_size(),
         })
     }
 
@@ -1977,6 +1993,16 @@ pub struct MemTableStats {
     pub pending_wal_batch_count: usize,
     pub pending_wal_row_count: usize,
     pub pending_wal_estimated_bytes: usize,
+    /// Estimated bytes held by frozen memtables still awaiting their L0 flush.
+    pub frozen_memtable_bytes: usize,
+    /// Number of frozen memtables queued for flush (the L0 flush backlog).
+    pub frozen_memtable_count: usize,
+    /// Total unflushed bytes (active + frozen) — the quantity backpressure
+    /// compares against `max_unflushed_memtable_bytes`.
+    pub unflushed_memtable_bytes: usize,
+    /// Estimated heap bytes held by the active memtable's maintained in-memory
+    /// indexes (btree/HNSW/FTS), separate from `estimated_size` (row data).
+    pub index_memory_bytes: usize,
 }
 
 /// WAL statistics.

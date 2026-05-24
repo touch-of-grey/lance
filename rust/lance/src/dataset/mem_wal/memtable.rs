@@ -719,9 +719,19 @@ impl MemTable {
         self.batch_count()
     }
 
-    /// Get estimated size in bytes.
+    /// Get estimated size in bytes. This covers the buffered row data and the
+    /// primary-key bloom filter only — NOT the maintained in-memory indexes
+    /// (see [`Self::index_memory_size`]).
     pub fn estimated_size(&self) -> usize {
         self.batch_store.estimated_bytes() + self.pk_bloom_filter.estimated_memory_size()
+    }
+
+    /// Estimated heap bytes held by the maintained in-memory indexes
+    /// (btree/HNSW/FTS), separate from the row data in [`Self::estimated_size`].
+    pub fn index_memory_size(&self) -> usize {
+        self.indexes
+            .as_ref()
+            .map_or(0, |idx| idx.index_memory_bytes())
     }
 
     /// Get the WAL batch mapping.

@@ -175,9 +175,12 @@ impl MemTableFlusher {
         let reader =
             RecordBatchIterator::new(batches.into_iter().map(Ok), memtable.schema().clone());
 
-        // Use very large max_rows_per_file to ensure 1 fragment per flushed memtable
+        // Use very large max_rows_per_file to ensure 1 fragment per flushed
+        // memtable. Pin the data file to v2.2 so a flushed generation is
+        // entirely v2.2 (matching the index files).
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
             ..Default::default()
         };
         Dataset::write(reader, &uri, Some(write_params)).await?;
@@ -585,7 +588,8 @@ impl MemTableFlusher {
         use arrow_schema::Schema as ArrowSchema;
         use lance_arrow::FixedSizeListArrayExt;
         use lance_core::ROW_ID;
-        use lance_file::writer::FileWriter;
+        use lance_file::version::LanceFileVersion;
+        use lance_file::writer::{FileWriter, FileWriterOptions};
         use lance_index::pb;
         use lance_index::vector::DISTANCE_TYPE_KEY;
         use lance_index::vector::SQ_CODE_COLUMN;
@@ -670,11 +674,22 @@ impl MemTableFlusher {
             lance_index::vector::ivf::storage::IvfModel::new(zero_centroid_fsl.clone(), None);
         storage_ivf.add_partition(storage_batch.num_rows() as u32);
 
+        // Write the HNSW index files at format v2.2. The graph file additionally
+        // forces fullzip encoding for its variable-length List columns (see
+        // below): at scale, with the many empty higher-level neighbor lists,
+        // the v2.x miniblock List codec mis-reconstructs the row count on read,
+        // and at v2.1 the dense level-0 list chunks also overflow the 32 KiB
+        // (u16) miniblock chunk cap on write.
+        let index_writer_options = || FileWriterOptions {
+            format_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+
         let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         let mut storage_writer = FileWriter::try_new(
             self.object_store.create(&storage_path).await?,
             (&storage_schema).try_into()?,
-            Default::default(),
+            index_writer_options(),
         )?;
         storage_writer.write_batch(&storage_batch).await?;
 
@@ -716,12 +731,37 @@ impl MemTableFlusher {
             .get(lance_index::vector::hnsw::builder::HNSW_METADATA_KEY)
             .cloned()
             .unwrap_or_default();
-        let index_schema: ArrowSchema = HNSW::schema().as_ref().clone();
+        // Force fullzip structural encoding for the graph's `List<u32>` /
+        // `List<f32>` columns. The HNSW graph has dense level-0 neighbor lists
+        // followed by many empty higher-level lists; the v2.x miniblock List
+        // codec mis-decodes the row count for that shape at scale (the
+        // `repdef_too_sparse_for_miniblock` fallback keys off a global
+        // levels-per-value average and misses the locally-sparse empty block).
+        // Fullzip round-trips it correctly. Tracked as a lance-encoding bug.
+        let fullzip_meta = std::collections::HashMap::from([(
+            lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.to_string(),
+            lance_encoding::constants::STRUCTURAL_ENCODING_FULLZIP.to_string(),
+        )]);
+        let index_schema: ArrowSchema = {
+            let base = HNSW::schema();
+            let fields = base
+                .fields()
+                .iter()
+                .map(|f| {
+                    if matches!(f.data_type(), arrow_schema::DataType::List(_)) {
+                        Arc::new(f.as_ref().clone().with_metadata(fullzip_meta.clone()))
+                    } else {
+                        f.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            ArrowSchema::new(fields)
+        };
         let index_path = index_dir.clone().join(INDEX_FILE_NAME);
         let mut index_writer = FileWriter::try_new(
             self.object_store.create(&index_path).await?,
             (&index_schema).try_into()?,
-            Default::default(),
+            index_writer_options(),
         )?;
         index_writer.write_batch(&hnsw_batch).await?;
 
@@ -1230,6 +1270,99 @@ mod tests {
             plan_str.contains("ANNIvfPartition:"),
             "query plan must use IVF partition, got: {plan_str}"
         );
+    }
+
+    /// Large-generation HNSW flush + read-back (>32k nodes). Diagnostic for the
+    /// v2.2 List read mismatch.
+    #[tokio::test]
+    async fn test_flusher_hnsw_large_generation_does_not_overflow_chunk() {
+        use super::super::super::index::IndexStore;
+        use crate::index::DatasetIndexExt;
+        use arrow_array::{FixedSizeListArray, Float32Array};
+        use lance_linalg::distance::DistanceType;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        let vector_dim = 8;
+        let num_vectors = 40_000usize;
+        let vector_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    vector_dim as i32,
+                ),
+                false,
+            ),
+        ]));
+        let vectors: Vec<f32> = (0..num_vectors * vector_dim)
+            .map(|i| ((i as f32 * 0.1).sin() + (i as f32 * 0.05).cos()) * 0.5)
+            .collect();
+        let index_configs = vec![MemIndexConfig::hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            DistanceType::L2,
+        )];
+        let mut memtable = MemTable::new(vector_schema.clone(), 1, vec![]).unwrap();
+        let registry = IndexStore::from_configs(&index_configs, num_vectors, 100).unwrap();
+        memtable.set_indexes(registry);
+        let ids = Int32Array::from_iter_values(0..num_vectors as i32);
+        let inner_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let vectors_fsl_data = FixedSizeListArray::try_new(
+            inner_field,
+            vector_dim as i32,
+            Arc::new(Float32Array::from(vectors)),
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            vector_schema.clone(),
+            vec![Arc::new(ids), Arc::new(vectors_fsl_data)],
+        )
+        .unwrap();
+        let frag_id = memtable.insert(batch).await.unwrap();
+        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            shard_id,
+            manifest_store.clone(),
+        );
+        let result = flusher
+            .flush_with_indexes(&memtable, epoch, &index_configs, 1)
+            .await
+            .unwrap();
+        assert_eq!(result.rows_flushed, num_vectors);
+
+        let gen_uri = format!(
+            "{}/_mem_wal/{}/{}",
+            base_uri, shard_id, result.generation.path
+        );
+        let dataset = Dataset::open(&gen_uri).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let query = Float32Array::from(
+            (0..vector_dim)
+                .map(|i| ((i as f32 * 0.1).sin() + (i as f32 * 0.05).cos()) * 0.5)
+                .collect::<Vec<_>>(),
+        );
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &query, 5).unwrap();
+        scan.fast_search();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert!(batch.num_rows() > 0, "index-only query returned no rows");
     }
 
     #[tokio::test]

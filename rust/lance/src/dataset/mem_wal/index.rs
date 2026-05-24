@@ -631,6 +631,27 @@ impl IndexStore {
         self.btree_indexes.len() + self.hnsw_indexes.len() + self.fts_indexes.len()
     }
 
+    /// Estimated total heap bytes held by all maintained in-memory indexes.
+    /// This is the memory the indexes add on top of the MemTable's buffered
+    /// row data (which is reported separately). Per-index figures are
+    /// approximate; see each index's `memory_size`/`memory_usage`.
+    pub fn index_memory_bytes(&self) -> usize {
+        self.btree_indexes
+            .values()
+            .map(|i| i.memory_size())
+            .sum::<usize>()
+            + self
+                .hnsw_indexes
+                .values()
+                .map(|i| i.memory_size())
+                .sum::<usize>()
+            + self
+                .fts_indexes
+                .values()
+                .map(|i| i.memory_usage())
+                .sum::<usize>()
+    }
+
     /// Get the visibility watermark (max batch position safe to read).
     ///
     /// Returns the highest batch position whose data is durable in the WAL
