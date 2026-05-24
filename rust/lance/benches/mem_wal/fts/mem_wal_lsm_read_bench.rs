@@ -122,7 +122,7 @@ struct Args {
     rescore_factor: u32,
     vector_dim: usize,
     ivf_partitions: usize,
-    rq_bits: u32,
+    rq_bits: u8,
     nprobes: usize,
     cache_dir: PathBuf,
     output: Option<PathBuf>,
