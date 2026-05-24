@@ -56,8 +56,8 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::scanner::{
-    FtsScoringMode, LsmDataSourceCollector, LsmFtsSearchPlanner, LsmPointLookupPlanner,
-    LsmVectorSearchPlanner, ShardSnapshot,
+    FlushedMemTableCache, FtsScoringMode, LsmDataSourceCollector, LsmFtsSearchPlanner,
+    LsmPointLookupPlanner, LsmVectorSearchPlanner, ShardSnapshot,
 };
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
@@ -816,13 +816,21 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
         }};
     }
 
+    // Shared across panels so repeated queries reuse opened flushed-generation
+    // datasets + warm their index caches, matching a long-lived production
+    // reader instead of cold-opening every flushed gen on each query.
+    let session = dataset.session();
+    let flushed_cache = Arc::new(FlushedMemTableCache::new(64));
+
     // ---- Panel 1: point lookup (btree across LSM) ----
     let pl_planner = LsmPointLookupPlanner::new(
         LsmDataSourceCollector::new(dataset.clone(), vec![snapshot!()])
             .with_active_memtable(shard_id, writer.active_memtable_ref().await?),
         pk_columns.clone(),
         arrow_schema.clone(),
-    );
+    )
+    .with_session(session.clone())
+    .with_flushed_cache(flushed_cache.clone());
     println!("running point-lookup panel ({} queries) ...", args.queries);
     let mut pl_lat = Vec::with_capacity(args.queries);
     for i in 0..args.queries {
@@ -844,7 +852,9 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
         arrow_schema.clone(),
         VECTOR_COL.to_string(),
         DistanceType::Cosine,
-    );
+    )
+    .with_session(session.clone())
+    .with_flushed_cache(flushed_cache.clone());
     println!(
         "running vector panel ({} queries, k={}, nprobes={}) ...",
         args.queries, args.k, args.nprobes
