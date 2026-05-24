@@ -454,7 +454,13 @@ async fn run_prepare(args: &Args) -> Result<()> {
     }
     let reader = RecordBatchIterator::new(batches.into_iter(), schema.clone());
     let write_start = Instant::now();
-    let mut dataset = Dataset::write(reader, &args.uri, Some(WriteParams::default())).await?;
+    // Pin the base table to Lance file format v2.2 (matching the flushed
+    // generations) so the whole LSM read benchmark is v2.2 end to end.
+    let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, &args.uri, Some(write_params)).await?;
     println!(
         "wrote {} base rows in {:.1}s",
         args.base_rows,

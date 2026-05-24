@@ -43,7 +43,8 @@ CACHE_DIR="${CACHE_DIR:-${TMPDIR:-/tmp}/lance-fineweb-cache}"
 BASE_ROWS_LIST="${BASE_ROWS_LIST:-100000 1000000}"
 K_LIST="${K_LIST:-10 100}"
 MAX_MEMTABLE_ROWS="${MAX_MEMTABLE_ROWS:-100000}"
-FLUSHED_GENERATIONS="${FLUSHED_GENERATIONS:-2}"
+# Sweep number of flushed LSM layers (0 = memtable-only over base table).
+FLUSHED_GENERATIONS_LIST="${FLUSHED_GENERATIONS_LIST:-0 1 2 5}"
 QUERIES="${QUERIES:-200}"
 RESCORE_FACTOR="${RESCORE_FACTOR:-10}"
 BACKENDS="${BACKENDS:-nvme s3}"
@@ -93,6 +94,7 @@ for backend in $BACKENDS; do
     prefix="$(backend_prefix "$backend")"
     for base_rows in $BASE_ROWS_LIST; do
         case "$base_rows" in
+            10000000) btag=10M ;;
             1000000) btag=1M ;;
             100000)  btag=100k ;;
             *)       btag="${base_rows}" ;;
@@ -105,9 +107,10 @@ for backend in $BACKENDS; do
             --base-rows "$base_rows" --batch-rows 1000 \
             --cache-dir "$CACHE_DIR" || continue
 
-        # search for each k
+        # search for each (flushed-generations layer count, k)
+        for gens in $FLUSHED_GENERATIONS_LIST; do
         for k in $K_LIST; do
-            name="search_${backend}_${btag}_k${k}"
+            name="search_${backend}_${btag}_g${gens}_k${k}"
             out="$LOCAL_DIR/${name}.json"
             if [ -f "$out" ]; then
                 echo ">>> $name (already done, skipping)"
@@ -117,7 +120,7 @@ for backend in $BACKENDS; do
                 --phase search --uri "$uri" \
                 --base-rows "$base_rows" \
                 --max-memtable-rows "$MAX_MEMTABLE_ROWS" \
-                --flushed-generations "$FLUSHED_GENERATIONS" \
+                --flushed-generations "$gens" \
                 --batch-rows 1000 \
                 --queries "$QUERIES" --k "$k" \
                 --rescore-factor "$RESCORE_FACTOR" \
@@ -125,6 +128,7 @@ for backend in $BACKENDS; do
                 --output "$out"
             # mirror result to s3 for durability regardless of backend
             [ -f "$out" ] && aws s3 cp "$out" "$S3_PREFIX/$RUN_ID/results/${name}.json" >/dev/null 2>&1
+        done
         done
     done
 done
