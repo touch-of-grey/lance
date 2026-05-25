@@ -42,14 +42,14 @@
 #![recursion_limit = "256"]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator, StringArray,
+    Array, FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use datafusion::prelude::SessionContext;
@@ -637,9 +637,8 @@ async fn run_prepare(args: &Args) -> Result<()> {
 // Search phase
 // ----------------------------------------------------------------------
 
-/// Result row ids per query for one mode + the latency distribution.
+/// Latency distribution for one FTS scoring mode.
 struct ModeRun {
-    top_ids: Vec<HashSet<i64>>,
     latencies_us: Vec<f64>,
 }
 
@@ -650,7 +649,6 @@ async fn run_mode(
     k: usize,
 ) -> Result<ModeRun> {
     let ctx = SessionContext::new();
-    let mut top_ids = Vec::with_capacity(queries.len());
     let mut latencies_us = Vec::with_capacity(queries.len());
     for q in queries {
         let t0 = Instant::now();
@@ -658,47 +656,10 @@ async fn run_mode(
             .plan_search(TEXT_COL, FullTextSearchQuery::new(q.clone()), k, None, mode)
             .await?;
         let stream = plan.execute(0, ctx.task_ctx())?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let _batches: Vec<RecordBatch> = stream.try_collect().await?;
         latencies_us.push(t0.elapsed().as_micros() as f64);
-
-        let mut ids: HashSet<i64> = HashSet::new();
-        for b in &batches {
-            if let Some(col) = b
-                .column_by_name("id")
-                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-            {
-                for i in 0..col.len() {
-                    ids.insert(col.value(i));
-                }
-            }
-        }
-        top_ids.push(ids);
     }
-    Ok(ModeRun {
-        top_ids,
-        latencies_us,
-    })
-}
-
-fn mean_jaccard(a: &[HashSet<i64>], b: &[HashSet<i64>]) -> f64 {
-    let pairs: Vec<f64> = a
-        .iter()
-        .zip(b.iter())
-        .filter_map(|(x, y)| {
-            if x.is_empty() && y.is_empty() {
-                None
-            } else {
-                let inter = x.intersection(y).count() as f64;
-                let union = x.union(y).count() as f64;
-                Some(inter / union)
-            }
-        })
-        .collect();
-    if pairs.is_empty() {
-        0.0
-    } else {
-        pairs.iter().sum::<f64>() / pairs.len() as f64
-    }
+    Ok(ModeRun { latencies_us })
 }
 
 async fn run_search(args: &Args) -> Result<Vec<(usize, serde_json::Value)>> {
@@ -838,7 +799,7 @@ async fn run_search(args: &Args) -> Result<Vec<(usize, serde_json::Value)>> {
     // Spread query keys across base table and the memtable id range so every
     // query touches base + flushed gens + active memtable.
     let pick_id = |i: usize| -> i64 {
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             ((i as i64) * 7919) % args.base_rows.max(1) as i64
         } else {
             id_base + (((i as i64) * 7919) % n_mt)
