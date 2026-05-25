@@ -119,6 +119,8 @@ struct Args {
     batch_rows: usize,
     queries: usize,
     k: usize,
+    /// Top-k values to sweep within a single ingest. Defaults to `[k]`.
+    k_values: Vec<usize>,
     rescore_factor: u32,
     vector_dim: usize,
     ivf_partitions: usize,
@@ -126,6 +128,9 @@ struct Args {
     nprobes: usize,
     cache_dir: PathBuf,
     output: Option<PathBuf>,
+    /// Directory + tag for per-k outputs: `<output_dir>/search_<tag>_k<K>.json`.
+    output_dir: Option<PathBuf>,
+    output_tag: Option<String>,
 }
 
 impl Default for Args {
@@ -139,6 +144,7 @@ impl Default for Args {
             batch_rows: 1_000,
             queries: 200,
             k: 10,
+            k_values: Vec::new(),
             rescore_factor: 10,
             vector_dim: 128,
             ivf_partitions: 1024,
@@ -146,6 +152,8 @@ impl Default for Args {
             nprobes: 16,
             cache_dir: std::env::temp_dir().join("mem_wal_fineweb_fts_cache"),
             output: None,
+            output_dir: None,
+            output_tag: None,
         }
     }
 }
@@ -187,6 +195,12 @@ fn parse_args() -> Result<Args> {
             "--batch-rows" => args.batch_rows = parse_val(&flag, &value)?,
             "--queries" => args.queries = parse_val(&flag, &value)?,
             "--k" => args.k = parse_val(&flag, &value)?,
+            "--k-list" => {
+                args.k_values = value
+                    .split(',')
+                    .map(|s| parse_val::<usize>(&flag, s.trim()))
+                    .collect::<Result<Vec<_>>>()?;
+            }
             "--rescore-factor" => args.rescore_factor = parse_val(&flag, &value)?,
             "--vector-dim" => args.vector_dim = parse_val(&flag, &value)?,
             "--ivf-partitions" => args.ivf_partitions = parse_val(&flag, &value)?,
@@ -194,6 +208,8 @@ fn parse_args() -> Result<Args> {
             "--nprobes" => args.nprobes = parse_val(&flag, &value)?,
             "--cache-dir" => args.cache_dir = PathBuf::from(value),
             "--output" => args.output = Some(PathBuf::from(value)),
+            "--output-dir" => args.output_dir = Some(PathBuf::from(value)),
+            "--tag" => args.output_tag = Some(value),
             _ => {
                 return Err(lance_core::Error::invalid_input(format!(
                     "unknown argument: {flag}"
@@ -213,6 +229,9 @@ fn parse_args() -> Result<Args> {
         return Err(lance_core::Error::invalid_input(
             "base-rows, max-memtable-rows, batch-rows must be > 0",
         ));
+    }
+    if args.k_values.is_empty() {
+        args.k_values = vec![args.k];
     }
     Ok(args)
 }
@@ -673,7 +692,7 @@ fn mean_jaccard(a: &[HashSet<i64>], b: &[HashSet<i64>]) -> f64 {
     }
 }
 
-async fn run_search(args: &Args) -> Result<serde_json::Value> {
+async fn run_search(args: &Args) -> Result<Vec<(usize, serde_json::Value)>> {
     let dataset = Arc::new(Dataset::open(&args.uri).await?);
     let arrow_schema: Arc<ArrowSchema> = Arc::new(ArrowSchema::from(dataset.schema()));
     let schema = make_schema(args.vector_dim);
@@ -822,7 +841,9 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
     let session = dataset.session();
     let flushed_cache = Arc::new(FlushedMemTableCache::new(64));
 
-    // ---- Panel 1: point lookup (btree across LSM) ----
+    // Build the three planners once; they are k-independent, so a single
+    // ingest can serve every top-k in `args.k_values`. All three share the
+    // session + flushed cache so flushed-gen datasets open once and stay warm.
     let pl_planner = LsmPointLookupPlanner::new(
         LsmDataSourceCollector::new(dataset.clone(), vec![snapshot!()])
             .with_active_memtable(shard_id, writer.active_memtable_ref().await?),
@@ -831,20 +852,6 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
     )
     .with_session(session.clone())
     .with_flushed_cache(flushed_cache.clone());
-    println!("running point-lookup panel ({} queries) ...", args.queries);
-    let mut pl_lat = Vec::with_capacity(args.queries);
-    for i in 0..args.queries {
-        let t0 = Instant::now();
-        let plan = pl_planner
-            .plan_lookup(&[ScalarValue::Int64(Some(pick_id(i)))], None)
-            .await?;
-        let _b: Vec<RecordBatch> = plan.execute(0, task_ctx.clone())?.try_collect().await?;
-        pl_lat.push(t0.elapsed().as_micros() as f64);
-    }
-    let pl_stats = compute_stats(pl_lat);
-
-    // ---- Panel 2: vector (IVF_RQ base + HNSW layers). overfetch_factor < 1.0
-    //      turns stale filtering off (allow stale rows, no extra PK dedup filter). ----
     let vec_planner = LsmVectorSearchPlanner::new(
         LsmDataSourceCollector::new(dataset.clone(), vec![snapshot!()])
             .with_in_memory_memtables(shard_id, writer.in_memory_memtable_refs().await?),
@@ -855,56 +862,18 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
     )
     .with_session(session.clone())
     .with_flushed_cache(flushed_cache.clone());
-    println!(
-        "running vector panel ({} queries, k={}, nprobes={}) ...",
-        args.queries, args.k, args.nprobes
-    );
-    let mut vec_lat = Vec::with_capacity(args.queries);
-    for i in 0..args.queries {
-        let fsl = wrap_query(&gen_vector(pick_id(i), args.vector_dim), args.vector_dim);
-        let t0 = Instant::now();
-        let plan = vec_planner
-            .plan_search(&fsl, args.k, args.nprobes, None, false, 0.0)
-            .await?;
-        let _b: Vec<RecordBatch> = plan.execute(0, task_ctx.clone())?.try_collect().await?;
-        vec_lat.push(t0.elapsed().as_micros() as f64);
-    }
-    let vec_stats = compute_stats(vec_lat);
-
-    // ---- Panel 3: FTS (Local mode) ----
     let fts_planner = LsmFtsSearchPlanner::new(
         LsmDataSourceCollector::new(dataset.clone(), vec![snapshot!()])
             .with_in_memory_memtables(shard_id, writer.in_memory_memtable_refs().await?),
         pk_columns.clone(),
         arrow_schema.clone(),
-    );
+    )
+    .with_session(session.clone())
+    .with_flushed_cache(flushed_cache.clone());
     let sample_end = mt_corpus
         .len()
         .min(sample_rows.max(total_memtable_rows.min(50_000)));
     let fts_queries = build_query_terms(&mt_corpus[..sample_end], args.queries);
-    println!(
-        "running FTS panel ({} queries, k={}) ...",
-        fts_queries.len(),
-        args.k
-    );
-    let fts_run = run_mode(&fts_planner, FtsScoringMode::Local, &fts_queries, args.k).await?;
-    let fts_stats = compute_stats(fts_run.latencies_us.clone());
-
-    // Keep writer alive so the active memtable stays reachable.
-    std::mem::forget(writer);
-
-    println!(
-        "point_lookup: p50={}us p99={}us qps={:.0}",
-        pl_stats.p50_us, pl_stats.p99_us, pl_stats.qps
-    );
-    println!(
-        "vector:       p50={}us p99={}us qps={:.0}",
-        vec_stats.p50_us, vec_stats.p99_us, vec_stats.qps
-    );
-    println!(
-        "fts:          p50={}us p99={}us qps={:.0}",
-        fts_stats.p50_us, fts_stats.p99_us, fts_stats.qps
-    );
 
     let panel = |s: &LatencyStats| {
         json!({
@@ -912,22 +881,85 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
             "mean_us": s.mean_us as u64, "qps": s.qps as u64,
         })
     };
-    Ok(json!({
-        "bench": "mem_wal_lsm_read",
-        "phase": "search",
-        "uri_kind": if is_cloud_uri(&args.uri) { "cloud" } else { "local" },
-        "base_rows": args.base_rows,
-        "max_memtable_rows": args.max_memtable_rows,
-        "flushed_generations": num_flushed,
-        "active_rows": active_rows,
-        "k": args.k,
-        "vector_dim": args.vector_dim,
-        "nprobes": args.nprobes,
-        "queries": args.queries,
-        "point_lookup": panel(&pl_stats),
-        "vector": panel(&vec_stats),
-        "fts": panel(&fts_stats),
-    }))
+
+    let mut results = Vec::with_capacity(args.k_values.len());
+    for &k in &args.k_values {
+        println!("===== k={k} =====");
+
+        // ---- Panel 1: point lookup (btree across LSM; k-independent) ----
+        println!("running point-lookup panel ({} queries) ...", args.queries);
+        let mut pl_lat = Vec::with_capacity(args.queries);
+        for i in 0..args.queries {
+            let t0 = Instant::now();
+            let plan = pl_planner
+                .plan_lookup(&[ScalarValue::Int64(Some(pick_id(i)))], None)
+                .await?;
+            let _b: Vec<RecordBatch> = plan.execute(0, task_ctx.clone())?.try_collect().await?;
+            pl_lat.push(t0.elapsed().as_micros() as f64);
+        }
+        let pl_stats = compute_stats(pl_lat);
+
+        // ---- Panel 2: vector (IVF_RQ base + HNSW layers). overfetch_factor
+        //      < 1.0 turns stale filtering off (allow stale rows). ----
+        println!(
+            "running vector panel ({} queries, k={k}, nprobes={}) ...",
+            args.queries, args.nprobes
+        );
+        let mut vec_lat = Vec::with_capacity(args.queries);
+        for i in 0..args.queries {
+            let fsl = wrap_query(&gen_vector(pick_id(i), args.vector_dim), args.vector_dim);
+            let t0 = Instant::now();
+            let plan = vec_planner
+                .plan_search(&fsl, k, args.nprobes, None, false, 0.0)
+                .await?;
+            let _b: Vec<RecordBatch> = plan.execute(0, task_ctx.clone())?.try_collect().await?;
+            vec_lat.push(t0.elapsed().as_micros() as f64);
+        }
+        let vec_stats = compute_stats(vec_lat);
+
+        // ---- Panel 3: FTS (Local mode) ----
+        println!(
+            "running FTS panel ({} queries, k={k}) ...",
+            fts_queries.len()
+        );
+        let fts_run = run_mode(&fts_planner, FtsScoringMode::Local, &fts_queries, k).await?;
+        let fts_stats = compute_stats(fts_run.latencies_us.clone());
+
+        println!(
+            "k={k}  point: p50={}us p99={}us | vector: p50={}us p99={}us | fts: p50={}us p99={}us",
+            pl_stats.p50_us,
+            pl_stats.p99_us,
+            vec_stats.p50_us,
+            vec_stats.p99_us,
+            fts_stats.p50_us,
+            fts_stats.p99_us,
+        );
+
+        results.push((
+            k,
+            json!({
+                "bench": "mem_wal_lsm_read",
+                "phase": "search",
+                "uri_kind": if is_cloud_uri(&args.uri) { "cloud" } else { "local" },
+                "base_rows": args.base_rows,
+                "max_memtable_rows": args.max_memtable_rows,
+                "flushed_generations": num_flushed,
+                "active_rows": active_rows,
+                "k": k,
+                "vector_dim": args.vector_dim,
+                "nprobes": args.nprobes,
+                "queries": args.queries,
+                "point_lookup": panel(&pl_stats),
+                "vector": panel(&vec_stats),
+                "fts": panel(&fts_stats),
+            }),
+        ));
+    }
+
+    // Keep writer alive so the active memtable stays reachable.
+    std::mem::forget(writer);
+
+    Ok(results)
 }
 
 // ----------------------------------------------------------------------
@@ -950,18 +982,28 @@ async fn run(args: Args) -> Result<()> {
     match args.phase {
         Phase::Prepare => run_prepare(&args).await?,
         Phase::Search => {
-            let result = run_search(&args).await?;
-            let text = serde_json::to_string_pretty(&result)
-                .map_err(|e| lance_core::Error::io(format!("serialize: {e}")))?;
-            println!("{text}");
-            if let Some(path) = &args.output {
-                if let Some(parent) = path.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    std::fs::create_dir_all(parent).ok();
+            let results = run_search(&args).await?;
+            for (k, result) in &results {
+                let text = serde_json::to_string_pretty(result)
+                    .map_err(|e| lance_core::Error::io(format!("serialize: {e}")))?;
+                println!("{text}");
+                // Per-k output: <output_dir>/search_<tag>_k<K>.json takes
+                // precedence; otherwise fall back to a single --output file
+                // (only meaningful for a single k).
+                let out_path = match (&args.output_dir, &args.output_tag) {
+                    (Some(dir), Some(tag)) => Some(dir.join(format!("search_{tag}_k{k}.json"))),
+                    _ => args.output.clone(),
+                };
+                if let Some(path) = out_path {
+                    if let Some(parent) = path.parent()
+                        && !parent.as_os_str().is_empty()
+                    {
+                        std::fs::create_dir_all(parent).ok();
+                    }
+                    std::fs::write(&path, text.as_bytes()).map_err(|e| {
+                        lance_core::Error::io(format!("write {}: {e}", path.display()))
+                    })?;
                 }
-                std::fs::write(path, text.as_bytes())
-                    .map_err(|e| lance_core::Error::io(format!("write {}: {e}", path.display())))?;
             }
         }
     }

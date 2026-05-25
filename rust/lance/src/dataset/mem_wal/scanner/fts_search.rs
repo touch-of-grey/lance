@@ -53,11 +53,13 @@ use tracing::instrument;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
+use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::project_to_canonical;
 use crate::Dataset;
 use crate::dataset::mem_wal::index::FtsCandidate;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+use crate::session::Session;
 
 /// `_score` column name in FTS results — kept aligned with
 /// `lance_index::scalar::inverted::SCORE_COL` so this module doesn't
@@ -120,6 +122,10 @@ pub struct LsmFtsSearchPlanner {
     collector: LsmDataSourceCollector,
     pk_columns: Vec<String>,
     base_schema: SchemaRef,
+    /// Session threaded into flushed-generation opens (shared caches).
+    session: Option<Arc<Session>>,
+    /// Cache of opened flushed-generation datasets.
+    flushed_cache: Option<Arc<FlushedMemTableCache>>,
 }
 
 impl LsmFtsSearchPlanner {
@@ -133,7 +139,23 @@ impl LsmFtsSearchPlanner {
             collector,
             pk_columns,
             base_schema,
+            session: None,
+            flushed_cache: None,
         }
+    }
+
+    /// Thread a session into flushed-generation opens so the first open
+    /// populates the shared index / file-metadata caches.
+    pub fn with_session(mut self, session: Arc<Session>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Inject a cache of opened flushed-generation datasets, making repeated
+    /// searches against the same generation a pure `Arc::clone`.
+    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+        self.flushed_cache = Some(cache);
+        self
     }
 
     /// Build the FTS execution plan.
@@ -314,9 +336,12 @@ impl LsmFtsSearchPlanner {
                     }
                 }
                 LsmDataSource::FlushedMemTable { path, .. } => {
-                    let dataset = crate::dataset::DatasetBuilder::from_uri(path)
-                        .load()
-                        .await?;
+                    let dataset = open_flushed_dataset(
+                        path,
+                        self.session.as_ref(),
+                        self.flushed_cache.as_ref(),
+                    )
+                    .await?;
                     if let Some(idx) = open_inverted_index(&dataset, column).await? {
                         return Ok(idx.params().clone());
                     }
@@ -368,11 +393,9 @@ impl LsmFtsSearchPlanner {
                 Self::lance_handle(dataset.clone(), column, params, tokens).await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset = Arc::new(
-                    crate::dataset::DatasetBuilder::from_uri(path)
-                        .load()
-                        .await?,
-                );
+                let dataset =
+                    open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
+                        .await?;
                 Self::lance_handle(dataset, column, params, tokens).await
             }
         }
@@ -581,9 +604,9 @@ impl LsmFtsSearchPlanner {
                 scanner.create_plan().await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset = crate::dataset::DatasetBuilder::from_uri(path)
-                    .load()
-                    .await?;
+                let dataset =
+                    open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
+                        .await?;
                 let mut scanner = dataset.scan();
                 let cols = self.fts_scanner_projection(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
