@@ -55,18 +55,21 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
+use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::mem_wal::scanner::{
     FlushedMemTableCache, FtsScoringMode, LsmDataSourceCollector, LsmFtsSearchPlanner,
     LsmPointLookupPlanner, LsmVectorSearchPlanner, ShardSnapshot,
 };
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
-use lance::dataset::{Dataset, WriteParams};
+use lance::dataset::{DEFAULT_METADATA_CACHE_SIZE, Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
+use lance::session::Session;
 use lance_core::Result;
 use lance_index::IndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+use lance_io::object_store::ObjectStoreRegistry;
 use lance_linalg::distance::DistanceType;
 use lance_tokenizer::TokenStream;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
@@ -126,6 +129,10 @@ struct Args {
     ivf_partitions: usize,
     rq_bits: u8,
     nprobes: usize,
+    /// Shared index-cache size in GiB for the base + flushed-gen session.
+    /// The default 6 GiB overflows once ~5 flushed FTS layers are in scope,
+    /// thrashing the inverted-index postings; size it to hold the working set.
+    index_cache_gb: usize,
     cache_dir: PathBuf,
     output: Option<PathBuf>,
     /// Directory + tag for per-k outputs: `<output_dir>/search_<tag>_k<K>.json`.
@@ -150,6 +157,7 @@ impl Default for Args {
             ivf_partitions: 1024,
             rq_bits: 8,
             nprobes: 16,
+            index_cache_gb: 32,
             cache_dir: std::env::temp_dir().join("mem_wal_fineweb_fts_cache"),
             output: None,
             output_dir: None,
@@ -206,6 +214,7 @@ fn parse_args() -> Result<Args> {
             "--ivf-partitions" => args.ivf_partitions = parse_val(&flag, &value)?,
             "--rq-bits" => args.rq_bits = parse_val(&flag, &value)?,
             "--nprobes" => args.nprobes = parse_val(&flag, &value)?,
+            "--index-cache-gb" => args.index_cache_gb = parse_val(&flag, &value)?,
             "--cache-dir" => args.cache_dir = PathBuf::from(value),
             "--output" => args.output = Some(PathBuf::from(value)),
             "--output-dir" => args.output_dir = Some(PathBuf::from(value)),
@@ -693,7 +702,21 @@ fn mean_jaccard(a: &[HashSet<i64>], b: &[HashSet<i64>]) -> f64 {
 }
 
 async fn run_search(args: &Args) -> Result<Vec<(usize, serde_json::Value)>> {
-    let dataset = Arc::new(Dataset::open(&args.uri).await?);
+    // Open the base with an explicitly sized index cache; the same session is
+    // threaded into every flushed-gen open, so all sources share one cache.
+    // The 6 GiB default overflows once ~5 flushed FTS layers are resident.
+    let session = Arc::new(Session::new(
+        args.index_cache_gb << 30,
+        DEFAULT_METADATA_CACHE_SIZE,
+        Arc::new(ObjectStoreRegistry::default()),
+    ));
+    println!("index cache: {} GiB", args.index_cache_gb);
+    let dataset = Arc::new(
+        DatasetBuilder::from_uri(&args.uri)
+            .with_session(session)
+            .load()
+            .await?,
+    );
     let arrow_schema: Arc<ArrowSchema> = Arc::new(ArrowSchema::from(dataset.schema()));
     let schema = make_schema(args.vector_dim);
 
