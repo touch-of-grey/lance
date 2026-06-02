@@ -180,7 +180,13 @@ async fn build_and_open(args: &Args, docs: &[String]) -> Result<(Arc<Dataset>, f
         .with_sync_indexed_write(true)
         .with_max_memtable_size(512 * 1024 * 1024 * 1024) // 512 GiB: never triggers
         .with_max_memtable_rows(docs.len().max(1))
-        .with_max_memtable_batches(max_batches);
+        .with_max_memtable_batches(max_batches)
+        // Backpressure (default 1 GiB) makes `put` wait *indefinitely* for a
+        // flush once unflushed bytes exceed it. Since we deliberately suppress
+        // auto-flush to land a single generation, raise this above the whole
+        // corpus so it never engages — otherwise the writer deadlocks waiting
+        // for a flush that only happens at force-seal.
+        .with_max_unflushed_memtable_bytes(256 * 1024 * 1024 * 1024);
 
     let sch = schema();
     let writer = ShardWriter::open(
