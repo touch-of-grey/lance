@@ -33,7 +33,6 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 use tantivy::collector::TopDocs;
-use tantivy::directory::MmapDirectory;
 use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, TermQuery};
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, STORED, Schema, SchemaBuilder, TextFieldIndexing, TextOptions,
@@ -232,11 +231,11 @@ fn run(args: &Args) {
     let on_disk = args.dir.is_some();
     let index = if let Some(dir) = &args.dir {
         fs::create_dir_all(dir).unwrap();
-        Index::create_in_dir(dir, schema.clone())
+        Index::create_in_dir(dir, schema)
             .or_else(|_| Index::open_in_dir(dir))
             .unwrap_or_else(|e| panic!("create index in {}: {e}", dir.display()))
     } else {
-        Index::create_in_ram(schema.clone())
+        Index::create_in_ram(schema)
     };
     register_tokenizer(&index, args.run);
 
