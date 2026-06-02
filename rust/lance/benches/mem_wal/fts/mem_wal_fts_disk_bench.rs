@@ -208,7 +208,7 @@ async fn build_and_open(
     let manifest = writer
         .manifest()
         .await?
-        .ok_or_else(|| lance_core::Error::io("no manifest after flush".into()))?;
+        .ok_or_else(|| lance_core::Error::io("no manifest after flush"))?;
     if manifest.flushed_generations.len() != 1 {
         return Err(lance_core::Error::io(format!(
             "expected exactly one flushed generation, got {}",
@@ -276,7 +276,6 @@ fn run(args: &Args) -> Result<()> {
     // Single-thread latency + top-k.
     let mut latencies_us: Vec<f64> = Vec::with_capacity(queries.len());
     let mut topk: Vec<Vec<usize>> = Vec::with_capacity(queries.len());
-    let st_start = Instant::now();
     rt.block_on(async {
         for q in &queries {
             let fq = make_query(q, args.run, args.k)?;
