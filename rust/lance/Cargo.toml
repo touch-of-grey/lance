@@ -137,6 +137,9 @@ geo-types = { workspace = true }
 datafusion-substrait = { workspace = true }
 parquet = { version = "58", default-features = false, features = ["arrow", "async"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Bench-only: the reference engine for the FTS comparison (sibling of the
+# Lucene Java bench). Not used by any library/test code.
+tantivy = "0.22"
 
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "geo"]
@@ -276,6 +279,16 @@ harness = false
 [[bench]]
 name = "mem_wal_fts_read_bench"
 path = "benches/mem_wal/fts/mem_wal_fts_read_bench.rs"
+harness = false
+
+[[bench]]
+name = "tantivy_fts_bench"
+path = "benches/mem_wal/fts/tantivy_fts_bench.rs"
+harness = false
+
+[[bench]]
+name = "mem_wal_fts_disk_bench"
+path = "benches/mem_wal/fts/mem_wal_fts_disk_bench.rs"
 harness = false
 
 # MemTable KV point-lookup benchmark (Lance vs RocksDB). Disabled as a build
