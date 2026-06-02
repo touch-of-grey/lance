@@ -167,14 +167,19 @@ async fn build_and_open(
     ))];
 
     let shard_id = Uuid::new_v4();
-    // Thresholds set high so the writer never auto-flushes mid-run; we
-    // force-seal once at the end to land everything in a single generation.
+    // Thresholds sized to the whole corpus so the writer never auto-flushes
+    // mid-run; we force-seal once at the end to land everything in a single
+    // generation. They must stay finite: `max_memtable_batches` pre-allocates
+    // the batch store and `is_batch_store_full()` flushes at that count, so we
+    // give it the exact batch count plus headroom rather than a huge sentinel.
+    let batch_size = 1000usize;
+    let max_batches = docs.len() / batch_size + 64;
     let config = ShardWriterConfig::new(shard_id)
         .with_durable_write(false)
         .with_sync_indexed_write(true)
-        .with_max_memtable_size(usize::MAX / 2)
+        .with_max_memtable_size(512 * 1024 * 1024 * 1024) // 512 GiB: never triggers
         .with_max_memtable_rows(docs.len().max(1))
-        .with_max_memtable_batches(usize::MAX / 2);
+        .with_max_memtable_batches(max_batches);
 
     let sch = schema();
     let writer =
@@ -182,7 +187,6 @@ async fn build_and_open(
             .await?;
 
     let build_start = Instant::now();
-    let batch_size = 1000;
     let mut row = 0usize;
     while row < docs.len() {
         let end = (row + batch_size).min(docs.len());
