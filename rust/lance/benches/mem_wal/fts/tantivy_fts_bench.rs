@@ -36,11 +36,11 @@ use tantivy::collector::TopDocs;
 use tantivy::directory::MmapDirectory;
 use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, TermQuery};
 use tantivy::schema::{
-    Field, IndexRecordOption, Schema, SchemaBuilder, TextFieldIndexing, TextOptions, Value, FAST,
-    STORED,
+    FAST, Field, IndexRecordOption, STORED, Schema, SchemaBuilder, TextFieldIndexing, TextOptions,
+    Value,
 };
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer, WhitespaceTokenizer};
-use tantivy::{doc, Index, IndexWriter, TantivyDocument, Term};
+use tantivy::{Index, IndexWriter, TantivyDocument, Term, doc};
 
 const TEXT_COL: &str = "text";
 const WS_TOKENIZER: &str = "ws_raw";
@@ -96,7 +96,11 @@ struct Q {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let argv: Vec<&str> = argv.iter().map(|s| s.as_str()).filter(|s| *s != "--bench").collect();
+    let argv: Vec<&str> = argv
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| *s != "--bench")
+        .collect();
     let get = |flag: &str, def: &str| -> String {
         argv.iter()
             .position(|a| *a == flag)
@@ -185,7 +189,10 @@ fn build_query(kind: &str, tokens: &[String], text_field: Field) -> Box<dyn Quer
             .map(|t| Term::from_field_text(text_field, t))
             .collect();
         if terms.len() == 1 {
-            return Box::new(TermQuery::new(terms[0].clone(), IndexRecordOption::WithFreqs));
+            return Box::new(TermQuery::new(
+                terms[0].clone(),
+                IndexRecordOption::WithFreqs,
+            ));
         }
         return Box::new(PhraseQuery::new(terms));
     }
@@ -210,7 +217,11 @@ fn build_query(kind: &str, tokens: &[String], text_field: Field) -> Box<dyn Quer
 }
 
 fn run(args: &Args) {
-    let corpus_file = if args.run == 'a' { "corpus_tok.txt" } else { "corpus.txt" };
+    let corpus_file = if args.run == 'a' {
+        "corpus_tok.txt"
+    } else {
+        "corpus.txt"
+    };
     let docs = read_lines(&args.in_dir.join(corpus_file));
     let query_lines = read_lines(&args.in_dir.join("queries.txt"));
     let truth_lines = read_lines(&args.in_dir.join("truth.txt"));
@@ -235,7 +246,9 @@ fn run(args: &Args) {
     let num_threads = if args.threads > 0 {
         args.threads
     } else {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
     };
     let heap = 1usize << 30; // 1 GiB total writer budget
     let build_start = Instant::now();
@@ -280,7 +293,11 @@ fn run(args: &Args) {
     }
     let truth: Vec<HashSet<usize>> = truth_lines
         .iter()
-        .map(|l| l.split_whitespace().filter_map(|s| s.parse().ok()).collect())
+        .map(|l| {
+            l.split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect()
+        })
         .collect();
 
     let built: Vec<(String, Box<dyn Query>)> = queries
@@ -300,7 +317,9 @@ fn run(args: &Args) {
 
     // ---- warm-up ----
     for (_, q) in &built {
-        let _ = searcher.search(q.as_ref(), &TopDocs::with_limit(args.k)).unwrap();
+        let _ = searcher
+            .search(q.as_ref(), &TopDocs::with_limit(args.k))
+            .unwrap();
     }
 
     // ---- single-thread latency + top-k ----
@@ -309,7 +328,9 @@ fn run(args: &Args) {
     let st_start = Instant::now();
     for (_, q) in &built {
         let t0 = Instant::now();
-        let hits = searcher.search(q.as_ref(), &TopDocs::with_limit(args.k)).unwrap();
+        let hits = searcher
+            .search(q.as_ref(), &TopDocs::with_limit(args.k))
+            .unwrap();
         latencies_us.push(t0.elapsed().as_secs_f64() * 1.0e6);
         let mut ids = Vec::with_capacity(hits.len());
         for (_score, addr) in hits {
@@ -331,7 +352,9 @@ fn run(args: &Args) {
                 .par_iter()
                 .map(|(_, q)| {
                     let s = reader.searcher();
-                    s.search(q.as_ref(), &TopDocs::with_limit(args.k)).unwrap().len()
+                    s.search(q.as_ref(), &TopDocs::with_limit(args.k))
+                        .unwrap()
+                        .len()
                 })
                 .sum::<usize>()
         })
@@ -368,12 +391,26 @@ fn run(args: &Args) {
             }
         }
     }
-    let term_recall_v = if term_n > 0 { term_recall / term_n as f64 } else { f64::NAN };
-    let phrase_recall_v = if phrase_n > 0 { phrase_recall / phrase_n as f64 } else { f64::NAN };
-    let or_recall_v = if or_n > 0 { or_recall / or_n as f64 } else { f64::NAN };
+    let term_recall_v = if term_n > 0 {
+        term_recall / term_n as f64
+    } else {
+        f64::NAN
+    };
+    let phrase_recall_v = if phrase_n > 0 {
+        phrase_recall / phrase_n as f64
+    } else {
+        f64::NAN
+    };
+    let or_recall_v = if or_n > 0 {
+        or_recall / or_n as f64
+    } else {
+        f64::NAN
+    };
 
     // ---- write top-k for the driver's mutual-overlap step ----
-    let topk_path = args.in_dir.join(format!("tantivy_run{}_topk.txt", args.run));
+    let topk_path = args
+        .in_dir
+        .join(format!("tantivy_run{}_topk.txt", args.run));
     let mut tw = BufWriter::new(fs::File::create(&topk_path).unwrap());
     for ids in &topk {
         let s: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
@@ -398,9 +435,15 @@ fn run(args: &Args) {
     sortf(&mut or_lat);
     println!(
         "result split impl=tantivy term_p50={:.1} term_p95={:.1} ({} q) | phrase_p50={:.1} phrase_p95={:.1} ({} q) | or_p50={:.1} or_p95={:.1} ({} q)",
-        percentile(&term_lat, 50.0), percentile(&term_lat, 95.0), term_lat.len(),
-        percentile(&phrase_lat, 50.0), percentile(&phrase_lat, 95.0), phrase_lat.len(),
-        percentile(&or_lat, 50.0), percentile(&or_lat, 95.0), or_lat.len(),
+        percentile(&term_lat, 50.0),
+        percentile(&term_lat, 95.0),
+        term_lat.len(),
+        percentile(&phrase_lat, 50.0),
+        percentile(&phrase_lat, 95.0),
+        phrase_lat.len(),
+        percentile(&or_lat, 50.0),
+        percentile(&or_lat, 95.0),
+        or_lat.len(),
     );
 
     latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -408,18 +451,39 @@ fn run(args: &Args) {
     println!(
         "result impl=tantivy mode={} run={} docs={} queries={} build_s={:.3} build_docs_per_s={:.0} \
          q_p50_us={:.1} q_p95_us={:.1} qps_1t={:.0} qps_nt={:.0} term_recall={:.4} phrase_recall={:.4} index_mb={:.1}",
-        mode, args.run, docs.len(), built.len(), build_s, docs.len() as f64 / build_s,
-        percentile(&latencies_us, 50.0), percentile(&latencies_us, 95.0),
-        qps_1t, qps_nt, term_recall_v, phrase_recall_v, mem_bytes as f64 / 1.0e6,
+        mode,
+        args.run,
+        docs.len(),
+        built.len(),
+        build_s,
+        docs.len() as f64 / build_s,
+        percentile(&latencies_us, 50.0),
+        percentile(&latencies_us, 95.0),
+        qps_1t,
+        qps_nt,
+        term_recall_v,
+        phrase_recall_v,
+        mem_bytes as f64 / 1.0e6,
     );
     println!(
         "{{\"impl\":\"tantivy\",\"mode\":\"{}\",\"run\":\"{}\",\"docs\":{},\"queries\":{},\"k\":{},\
          \"build_s\":{:.4},\"build_docs_per_s\":{:.1},\
          \"q_p50_us\":{:.2},\"q_p95_us\":{:.2},\"qps_1t\":{:.1},\"qps_nt\":{:.1},\
          \"term_recall_at_k\":{:.4},\"phrase_recall_at_k\":{:.4},\"or_recall_at_k\":{:.4},\"mem_bytes\":{}}}",
-        mode, args.run, docs.len(), built.len(), args.k,
-        build_s, docs.len() as f64 / build_s,
-        percentile(&latencies_us, 50.0), percentile(&latencies_us, 95.0),
-        qps_1t, qps_nt, term_recall_v, phrase_recall_v, or_recall_v, mem_bytes,
+        mode,
+        args.run,
+        docs.len(),
+        built.len(),
+        args.k,
+        build_s,
+        docs.len() as f64 / build_s,
+        percentile(&latencies_us, 50.0),
+        percentile(&latencies_us, 95.0),
+        qps_1t,
+        qps_nt,
+        term_recall_v,
+        phrase_recall_v,
+        or_recall_v,
+        mem_bytes,
     );
 }

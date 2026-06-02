@@ -39,13 +39,13 @@ use std::time::Instant;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::stream::{FuturesUnordered, StreamExt};
+use lance::Dataset;
 use lance::dataset::mem_wal::index::{FtsIndexConfig, MemIndexConfig};
 use lance::dataset::mem_wal::write::{ShardWriter, ShardWriterConfig};
-use lance::Dataset;
 use lance_core::Result;
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::PhraseQuery;
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
-use lance_index::scalar::FullTextSearchQuery;
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use uuid::Uuid;
@@ -130,15 +130,16 @@ async fn fts_topk(dataset: &Dataset, query: FullTextSearchQuery, k: usize) -> Re
     let ids = batch
         .column_by_name("id")
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-        .map(|a| (0..a.len()).map(|i| a.value(i) as usize).collect::<Vec<_>>())
+        .map(|a| {
+            (0..a.len())
+                .map(|i| a.value(i) as usize)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     Ok(ids)
 }
 
-async fn build_and_open(
-    args: &Args,
-    docs: &[String],
-) -> Result<(Arc<Dataset>, f64, u64, u64)> {
+async fn build_and_open(args: &Args, docs: &[String]) -> Result<(Arc<Dataset>, f64, u64, u64)> {
     // Fresh data dir per run so the single-generation invariant holds.
     let _ = fs::remove_dir_all(&args.data_dir);
     fs::create_dir_all(&args.data_dir)
@@ -182,9 +183,15 @@ async fn build_and_open(
         .with_max_memtable_batches(max_batches);
 
     let sch = schema();
-    let writer =
-        ShardWriter::open(store, base_path, base_uri.clone(), config, sch.clone(), index_configs)
-            .await?;
+    let writer = ShardWriter::open(
+        store,
+        base_path,
+        base_uri.clone(),
+        config,
+        sch.clone(),
+        index_configs,
+    )
+    .await?;
 
     let build_start = Instant::now();
     let mut row = 0usize;
@@ -221,7 +228,10 @@ async fn build_and_open(
     }
     let gen_rel = &manifest.flushed_generations[0].path;
     let gen_uri = format!("{}/_mem_wal/{}/{}", base_uri, shard_id, gen_rel);
-    let gen_fs = abs.join("_mem_wal").join(shard_id.to_string()).join(gen_rel);
+    let gen_fs = abs
+        .join("_mem_wal")
+        .join(shard_id.to_string())
+        .join(gen_rel);
     let total_gen_bytes = dir_bytes(&gen_fs);
     let fts_index_bytes = dir_bytes(&gen_fs.join("_indices"));
 
@@ -231,7 +241,11 @@ async fn build_and_open(
 }
 
 fn run(args: &Args) -> Result<()> {
-    let corpus_file = if args.run == 'a' { "corpus_tok.txt" } else { "corpus.txt" };
+    let corpus_file = if args.run == 'a' {
+        "corpus_tok.txt"
+    } else {
+        "corpus.txt"
+    };
     let docs = read_lines(&args.in_dir.join(corpus_file));
     let query_lines = read_lines(&args.in_dir.join("queries.txt"));
     let truth_lines = read_lines(&args.in_dir.join("truth.txt"));
@@ -239,7 +253,9 @@ fn run(args: &Args) -> Result<()> {
     let nthreads = if args.threads > 0 {
         args.threads
     } else {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
     };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(nthreads)
@@ -265,7 +281,11 @@ fn run(args: &Args) -> Result<()> {
     }
     let truth: Vec<HashSet<usize>> = truth_lines
         .iter()
-        .map(|l| l.split_whitespace().filter_map(|s| s.parse().ok()).collect())
+        .map(|l| {
+            l.split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect()
+        })
         .collect();
 
     // Warm-up.
@@ -344,12 +364,26 @@ fn run(args: &Args) -> Result<()> {
             }
         }
     }
-    let term_recall_v = if term_n > 0 { term_recall / term_n as f64 } else { f64::NAN };
-    let phrase_recall_v = if phrase_n > 0 { phrase_recall / phrase_n as f64 } else { f64::NAN };
-    let or_recall_v = if or_n > 0 { or_recall / or_n as f64 } else { f64::NAN };
+    let term_recall_v = if term_n > 0 {
+        term_recall / term_n as f64
+    } else {
+        f64::NAN
+    };
+    let phrase_recall_v = if phrase_n > 0 {
+        phrase_recall / phrase_n as f64
+    } else {
+        f64::NAN
+    };
+    let or_recall_v = if or_n > 0 {
+        or_recall / or_n as f64
+    } else {
+        f64::NAN
+    };
 
     // Write top-k for the driver's mutual-overlap step.
-    let topk_path = args.in_dir.join(format!("lance_disk_run{}_topk.txt", args.run));
+    let topk_path = args
+        .in_dir
+        .join(format!("lance_disk_run{}_topk.txt", args.run));
     let mut tw = BufWriter::new(
         fs::File::create(&topk_path)
             .map_err(|e| lance_core::Error::io(format!("create topk: {e}")))?,
@@ -377,9 +411,15 @@ fn run(args: &Args) -> Result<()> {
     sortf(&mut or_lat);
     println!(
         "result split impl=lance_disk term_p50={:.1} term_p95={:.1} ({} q) | phrase_p50={:.1} phrase_p95={:.1} ({} q) | or_p50={:.1} or_p95={:.1} ({} q)",
-        percentile(&term_lat, 50.0), percentile(&term_lat, 95.0), term_lat.len(),
-        percentile(&phrase_lat, 50.0), percentile(&phrase_lat, 95.0), phrase_lat.len(),
-        percentile(&or_lat, 50.0), percentile(&or_lat, 95.0), or_lat.len(),
+        percentile(&term_lat, 50.0),
+        percentile(&term_lat, 95.0),
+        term_lat.len(),
+        percentile(&phrase_lat, 50.0),
+        percentile(&phrase_lat, 95.0),
+        phrase_lat.len(),
+        percentile(&or_lat, 50.0),
+        percentile(&or_lat, 95.0),
+        or_lat.len(),
     );
 
     latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -387,10 +427,19 @@ fn run(args: &Args) -> Result<()> {
         "result impl=lance_disk mode=disk run={} docs={} queries={} build_s={:.3} build_docs_per_s={:.0} \
          q_p50_us={:.1} q_p95_us={:.1} qps_1t={:.0} qps_nt={:.0} term_recall={:.4} phrase_recall={:.4} \
          fts_index_mb={:.1} total_gen_mb={:.1}",
-        args.run, docs.len(), queries.len(), build_s, docs.len() as f64 / build_s,
-        percentile(&latencies_us, 50.0), percentile(&latencies_us, 95.0),
-        qps_1t, qps_nt, term_recall_v, phrase_recall_v,
-        fts_index_bytes as f64 / 1.0e6, total_gen_bytes as f64 / 1.0e6,
+        args.run,
+        docs.len(),
+        queries.len(),
+        build_s,
+        docs.len() as f64 / build_s,
+        percentile(&latencies_us, 50.0),
+        percentile(&latencies_us, 95.0),
+        qps_1t,
+        qps_nt,
+        term_recall_v,
+        phrase_recall_v,
+        fts_index_bytes as f64 / 1.0e6,
+        total_gen_bytes as f64 / 1.0e6,
     );
     println!(
         "{{\"impl\":\"lance_disk\",\"mode\":\"disk\",\"run\":\"{}\",\"docs\":{},\"queries\":{},\"k\":{},\
@@ -398,18 +447,33 @@ fn run(args: &Args) -> Result<()> {
          \"q_p50_us\":{:.2},\"q_p95_us\":{:.2},\"qps_1t\":{:.1},\"qps_nt\":{:.1},\
          \"term_recall_at_k\":{:.4},\"phrase_recall_at_k\":{:.4},\"or_recall_at_k\":{:.4},\
          \"mem_bytes\":{},\"fts_index_bytes\":{},\"total_gen_bytes\":{}}}",
-        args.run, docs.len(), queries.len(), args.k,
-        build_s, docs.len() as f64 / build_s,
-        percentile(&latencies_us, 50.0), percentile(&latencies_us, 95.0),
-        qps_1t, qps_nt, term_recall_v, phrase_recall_v, or_recall_v,
-        fts_index_bytes, fts_index_bytes, total_gen_bytes,
+        args.run,
+        docs.len(),
+        queries.len(),
+        args.k,
+        build_s,
+        docs.len() as f64 / build_s,
+        percentile(&latencies_us, 50.0),
+        percentile(&latencies_us, 95.0),
+        qps_1t,
+        qps_nt,
+        term_recall_v,
+        phrase_recall_v,
+        or_recall_v,
+        fts_index_bytes,
+        fts_index_bytes,
+        total_gen_bytes,
     );
     Ok(())
 }
 
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let argv: Vec<&str> = argv.iter().map(|s| s.as_str()).filter(|s| *s != "--bench").collect();
+    let argv: Vec<&str> = argv
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| *s != "--bench")
+        .collect();
     let get = |flag: &str, def: &str| -> String {
         argv.iter()
             .position(|a| *a == flag)
